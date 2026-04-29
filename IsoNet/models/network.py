@@ -197,9 +197,10 @@ class Net:
                 ddp_train(0, self.world_size, self.port_number, self.model, self.train_dataset, training_params)
 
         except KeyboardInterrupt:
-           logging.info('KeyboardInterrupt: Terminating all processes...')
-           dist.destroy_process_group() 
-           os.system("kill $(ps aux | grep multiprocessing.spawn | grep -v grep | awk '{print $2}')")
+            logging.info('KeyboardInterrupt: Terminating all processes...')
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            os.system("kill $(ps aux | grep multiprocessing.spawn | grep -v grep | awk '{print $2}')")
         self.load(f"{training_params['output_dir']}/network_{training_params['method']}_{training_params['arch']}_{training_params['cube_size']}_{training_params['split']}.pt")
 
         
@@ -222,15 +223,20 @@ class Net:
             write_mrc('{}/{}_iter{:0>2d}.mrc'.format(settings['output_dir'],
                                                      root_name,
                                                      settings['iter_count']-1), 
-                                                     -outData[i])
+                                                     -outData[i],
+                                                     voxel_size=pixel_size)
         return outData
 
     def predict(self, data, tmp_data_path, F_mask=None, idx=None):
         data = data[:,np.newaxis,:,:].astype(np.float32)
         data = torch.from_numpy(data)
         # logging.info('data_shape',data.shape)
-        mp.spawn(ddp_predict, args=(self.world_size, self.port_number, self.model, data, tmp_data_path,\
+        if self.world_size > 1:
+            mp.spawn(ddp_predict, args=(self.world_size, self.port_number, self.model, data, tmp_data_path,\
                                      F_mask,idx), nprocs=self.world_size)
+        else:
+            ddp_predict(0, self.world_size, self.port_number, self.model, data, tmp_data_path, F_mask, idx)
+
         all_outputs = []
         for r in range(self.world_size):
             rank_output_path = f"{tmp_data_path}_rank_{r}.npy"

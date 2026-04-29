@@ -83,8 +83,8 @@ class ISONET:
             cs: Spherical aberration in mm.
             voltage: Acceleration voltage in kV.
             ac: Amplitude contrast.
-            tilt_min: Minimum tilt angle.
-            tilt_max: Maximum tilt angle.
+            tilt_min: Minimum final tilt angle used for tomogram reconstruction from your `.tlt` or `.aln` file.
+            tilt_max: Maximum final tilt angle used for tomogram reconstruction from your `.tlt` or `.aln` file.
             tilt_step: Tilt step size.
             create_average: Whether to create average tomograms from even/odd pairs.
             number_subtomos: Number of subtomograms to be extracted during training. You can directly modify this in the generated star file or with gui if you want different numbers extracted for different tomograms.
@@ -411,8 +411,11 @@ class ISONET:
             prefix = f"{output_dir}/{output_prefix}_{network.method}_{network.arch}_{base}"
             
             out_data = []
+            voxel_size = None
             for tomo_p in tomo_paths:
-                tomo_vol, _ = read_mrc(tomo_p)
+                tomo_vol, current_voxel = read_mrc(tomo_p)
+                if voxel_size is None:
+                    voxel_size = current_voxel
                 # now we are using precentile again similar to isonet1
                 if network.method =='isonet2':
                     tomo_vol = normalize(tomo_vol * -1, percentile=True)
@@ -433,7 +436,7 @@ class ISONET:
             out_data = sum(out_data) / len(out_data)
 
             out_file = f"{prefix}.mrc"
-            write_mrc(out_file, out_data.astype(np.float32) * -1)
+            write_mrc(out_file, out_data.astype(np.float32) * -1, voxel_size=voxel_size)
             all_tomo_paths.append(out_file)
 
 
@@ -500,7 +503,7 @@ class ISONET:
             cube_size: Size in voxels of training subvolumes. Must be compatible with the network (divisible by the network downsampling factors). 
             epochs: Number of training epochs. 
             batch_size: Number of subtomograms per optimization step; if "auto", this is automatically determined by multiplying the number of available GPUs by 2. If the number of GPUs is 1, batch size is 4. Batch size per GPU matters for gradient stability. 
-            loss_func: Loss function to use (L2, Huber, L1). 
+            loss_func: Loss function to use (L2, Huber, L1, FSC). 
             save_interval: Interval to save model checkpoints. 
             learning_rate: Initial learning rate. 
             learning_rate_min: Minimum learning rate for scheduler. 
@@ -637,7 +640,7 @@ class ISONET:
             epochs: Number of training epochs. 
             input_column: Column name in STAR file to use as input tomograms. 
             batch_size: Number of subtomograms per optimization step; if None, this is automatically determined by multiplying the number of available GPUs by 2. If the number of GPUs is 1, batch size is 4. Batch size per GPU matters for gradient stability. 
-            loss_func: Loss function to use (L2, Huber, L1). 
+            loss_func: Loss function to use (L2, Huber, L1, FSC). 
             learning_rate: Initial learning rate. 
             save_interval: Interval to save model checkpoints. 
             learning_rate_min: Minimum learning rate for scheduler. 

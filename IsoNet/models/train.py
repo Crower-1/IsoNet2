@@ -8,7 +8,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from IsoNet.utils.utils import debug_matrix
 import random
-from IsoNet.models.masked_loss import masked_loss, apply_fourier_mask_to_tomo
+from IsoNet.models.masked_loss import FSCLoss, masked_loss, apply_fourier_mask_to_tomo
 from IsoNet.utils.plot_metrics import plot_metrics
 from IsoNet.utils.rotations import rotation_list, sample_rot_axis_and_angle, rotate_vol_around_axis_torch
 import torch.optim.lr_scheduler as lr_scheduler
@@ -114,8 +114,10 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
     optimizer = torch.optim.AdamW(model.parameters(), lr=training_params['learning_rate'])
     scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_params['T_max'], eta_min=training_params['learning_rate_min'])
 
-    loss_funcs = {"L2": nn.MSELoss(), "Huber": nn.HuberLoss(), "L1": nn.L1Loss()}
+    loss_funcs = {"L2": nn.MSELoss(), "Huber": nn.HuberLoss(), "L1": nn.L1Loss(), "FSC": FSCLoss()}
     loss_func = loss_funcs.get(training_params['loss_func'])
+    if loss_func is None:
+        raise ValueError(f"Unknown loss function: {training_params['loss_func']}")
     
     if training_params['mixed_precision']:
         scaler = GradScaler()
@@ -264,12 +266,12 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
                         new_noise_std = torch.std(preds_x1-preds_x2)/1.414
                         delta_noise_std = torch.sqrt(torch.abs(noise_std**2 - new_noise_std**2))
 
-                        preds_x1 = preds_x1 + torch.randn_like(preds_x1) * delta_noise_std
-                        preds_x2 = preds_x2 + torch.randn_like(preds_x2) * delta_noise_std
-
                         if training_params['CTF_mode'] in ['network', 'wiener']:
                             preds_x1 = apply_F_filter_torch(preds_x1, ctf)
                             preds_x2 = apply_F_filter_torch(preds_x2, ctf)
+
+                        preds_x1 = preds_x1 + torch.randn_like(preds_x1) * delta_noise_std
+                        preds_x2 = preds_x2 + torch.randn_like(preds_x2) * delta_noise_std
 
                         x1_filled = apply_F_filter_torch(preds_x1, 1-mw) + x1
                         x2_filled = apply_F_filter_torch(preds_x2, 1-mw) + x2
@@ -383,7 +385,7 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
             loss_str = f"Epoch [{epoch+1:3d}/{training_params['epochs']:3d}] Loss: {average_loss:6.5f}"
 
             if training_params['method'] in ['isonet2', 'isonet2-n2n']:
-                loss_str += f", inside_loss: {average_inside_loss:6.5f}, outside_loss: {average_outside_loss:6.5f}"
+                loss_str += f", n2n_loss: {average_inside_loss:6.5f}, mw_loss: {average_outside_loss:6.5f}"
             print(loss_str)
 
             plot_metrics(training_params["metrics"],f"{training_params['output_dir']}/loss_{training_params['split']}.png")
@@ -429,36 +431,45 @@ def ddp_predict(rank, world_size, port_number, model, data, tmp_data_path, F_mas
 
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port_number)
-    dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-    model = model.to(rank)
-    model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model = DDP(model, device_ids=[rank])
-    model.eval()
-
-    num_data_points = data.shape[0]
-    steps_per_rank = (num_data_points + world_size - 1) // world_size
-
-    outputs = []
-    with torch.no_grad():
-        for i in tqdm(
-            range(rank * steps_per_rank, min((rank + 1) * steps_per_rank, num_data_points)),
-            disable=(rank != 0), desc=f'Predicting Tomogram{f" {idx}" if idx is not None else ""}: '
-        ):
-            batch_input = data[i:i + 1].to(rank)
-            if F_mask is not None:
-                F_m = torch.from_numpy(F_mask[np.newaxis,np.newaxis,:,:,:]).to(rank)
-                batch_input = apply_F_filter_torch(batch_input, F_m)
-            batch_output = model(batch_input).cpu()  # Move output to CPU immediately
-            # if rank == 0:
-            #     write_mrc('testIN.mrc', batch_input[0][0].cpu().numpy().astype(np.float32))
-            #     write_mrc('testOUT.mrc', batch_output[0][0].numpy().astype(np.float32))
-            outputs.append(batch_output)
-
-    output = torch.cat(outputs, dim=0).cpu().numpy().astype(np.float32)
-    rank_output_path = f"{tmp_data_path}_rank_{rank}.npy"
-    np.save(rank_output_path, output)
     if world_size > 1:
-        dist.barrier()
-        dist.destroy_process_group()
+        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = model.to(rank)
+        model = DDP(model, device_ids=[rank])
+    else:
+        model = model.to(rank)
+
+    try:
+        model.eval()
+
+        num_data_points = data.shape[0]
+        steps_per_rank = (num_data_points + world_size - 1) // world_size
+
+        outputs = []
+        with torch.no_grad():
+            for i in tqdm(
+                range(rank * steps_per_rank, min((rank + 1) * steps_per_rank, num_data_points)),
+                disable=(rank != 0), desc=f'Predicting Tomogram{f" {idx}" if idx is not None else ""}: '
+            ):
+                batch_input = data[i:i + 1].to(rank)
+                if F_mask is not None:
+                    F_m = torch.from_numpy(F_mask[np.newaxis,np.newaxis,:,:,:]).to(rank)
+                    batch_input = apply_F_filter_torch(batch_input, F_m)
+                batch_output = model(batch_input).cpu()  # Move output to CPU immediately
+                # if rank == 0:
+                #     write_mrc('testIN.mrc', batch_input[0][0].cpu().numpy().astype(np.float32))
+                #     write_mrc('testOUT.mrc', batch_output[0][0].numpy().astype(np.float32))
+                outputs.append(batch_output)
+
+        output = torch.cat(outputs, dim=0).cpu().numpy().astype(np.float32)
+        rank_output_path = f"{tmp_data_path}_rank_{rank}.npy"
+        np.save(rank_output_path, output)
+
+        if world_size > 1:
+            dist.barrier()
+    finally:
+        if world_size > 1 and dist.is_initialized():
+            dist.destroy_process_group()
+
