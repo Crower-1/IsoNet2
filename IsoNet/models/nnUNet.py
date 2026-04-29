@@ -1,0 +1,176 @@
+"""
+IsoNet-compatible nnU-Net backbone.
+
+This module mirrors the nnU-Net v2 PlainConvUNet architecture while keeping the
+full decoder inside the main network (no detached classification head) and
+replacing the final segmentation layer with a 3×3×3 convolution that produces a
+single-channel logits volume. It is intended to be copied into IsoNet so that
+weights pretrained there can later be transferred back into nnU-Net.
+"""
+
+from typing import Sequence, Optional, Mapping, Any
+
+import torch
+from torch import nn
+from torch.nn import init as nn_init
+import torch.nn.functional as F
+
+from dynamic_network_architectures.architectures.unet import PlainConvUNet
+
+DEFAULT_FEATURES_PER_STAGE: Sequence[int] = (32, 64, 128, 256, 320, 320)
+DEFAULT_KERNEL_SIZES: Sequence[Sequence[int]] = (
+    (3, 3, 3),
+    (3, 3, 3),
+    (3, 3, 3),
+    (3, 3, 3),
+    (3, 3, 3),
+    (3, 3, 3),
+)
+DEFAULT_STRIDES: Sequence[Sequence[int]] = (
+    (1, 1, 1),
+    (2, 2, 2),
+    (2, 2, 2),
+    (2, 2, 2),
+    (2, 2, 2),
+    (2, 2, 2),
+)
+DEFAULT_N_CONV_PER_STAGE: Sequence[int] = (2, 2, 2, 2, 2, 2)
+DEFAULT_N_CONV_PER_STAGE_DECODER: Sequence[int] = (2, 2, 2, 2, 2)
+DEFAULT_CLASS_NAMES = [
+    "ER",
+    "mitochondria",
+    "MT",
+    "vesicle",
+    "membrane",
+    "ER_memb",
+    "mito_memb",
+    "MT_memb",
+    "vesicle_memb",
+    "actin",
+]
+
+
+__all__ = ["NNUNet"]
+
+
+class NNUNet(nn.Module):
+    """
+    Wrapper around PlainConvUNet with the decoder kept intact and a custom
+    3×3×3 segmentation layer for IsoNet pretraining.
+    """
+
+    def __init__(
+        self,
+        input_channels: int = 1,
+        features_per_stage: Sequence[int] = DEFAULT_FEATURES_PER_STAGE,
+        kernel_sizes: Sequence[Sequence[int]] = DEFAULT_KERNEL_SIZES,
+        strides: Sequence[Sequence[int]] = DEFAULT_STRIDES,
+        n_conv_per_stage: Sequence[int] = DEFAULT_N_CONV_PER_STAGE,
+        n_conv_per_stage_decoder: Sequence[int] = DEFAULT_N_CONV_PER_STAGE_DECODER,
+        conv_bias: bool = True,
+        norm_op: Optional[type[nn.Module]] = nn.InstanceNorm3d,
+        norm_op_kwargs: Optional[Mapping[str, Any]] = None,
+        dropout_op: Optional[type[nn.Module]] = None,
+        dropout_op_kwargs: Optional[Mapping[str, Any]] = None,
+        nonlin: Optional[type[nn.Module]] = nn.LeakyReLU,
+        nonlin_kwargs: Optional[Mapping[str, Any]] = None,
+        deep_supervision: bool = False,
+        initialize_weights: bool = True,
+        class_names: Optional[Sequence[str]] = None,
+        add_last: bool = False,
+    ) -> None:
+        super().__init__()
+        if norm_op_kwargs is None:
+            norm_op_kwargs = {"eps": 1e-5, "affine": True}
+        if nonlin_kwargs is None:
+            nonlin_kwargs = {"inplace": True}
+
+        self.add_last = add_last
+        self.out_channels = 1  # fixed single-channel head for IsoNet pretraining
+        self.class_names = list(class_names) if class_names is not None else list(DEFAULT_CLASS_NAMES)
+        self.learning_rate: Optional[float] = None
+        self.metrics = {"train_loss": [], "val_loss": []}
+
+        self.network = PlainConvUNet(
+            input_channels=input_channels,
+            n_stages=len(features_per_stage),
+            features_per_stage=features_per_stage,
+            conv_op=nn.Conv3d,
+            kernel_sizes=kernel_sizes,
+            strides=strides,
+            n_conv_per_stage=n_conv_per_stage,
+            num_classes=self.out_channels,
+            n_conv_per_stage_decoder=n_conv_per_stage_decoder,
+            conv_bias=conv_bias,
+            norm_op=norm_op,
+            norm_op_kwargs=dict(norm_op_kwargs),
+            dropout_op=dropout_op,
+            dropout_op_kwargs=None if dropout_op_kwargs is None else dict(dropout_op_kwargs),
+            nonlin=nonlin,
+            nonlin_kwargs=dict(nonlin_kwargs),
+            deep_supervision=deep_supervision,
+            nonlin_first=False,
+        )
+
+        if initialize_weights:
+            PlainConvUNet.initialize(self.network)
+
+        self.encoder = self.network.encoder
+        self.decoder = self.network.decoder
+        self.required_multiples = self._compute_required_multiples(strides)
+        self._replace_final_seg_layer(
+            in_channels=features_per_stage[0],
+            initialize=initialize_weights,
+        )
+
+    def _replace_final_seg_layer(self, in_channels: int, initialize: bool) -> None:
+        last_idx = len(self.decoder.seg_layers) - 1
+        final_conv = nn.Conv3d(
+            in_channels=in_channels,
+            out_channels=self.out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=True,
+        )
+        self.decoder.seg_layers[last_idx] = final_conv
+        self.final = final_conv
+
+        if initialize:
+            nn_init.kaiming_normal_(final_conv.weight, nonlinearity="leaky_relu")
+            if final_conv.bias is not None:
+                nn_init.constant_(final_conv.bias, 0.0)
+
+    @staticmethod
+    def _compute_required_multiples(strides: Sequence[Sequence[int]]) -> Sequence[int]:
+        totals = [1] * len(strides[0])
+        for stride in strides:
+            totals = [a * b for a, b in zip(totals, stride)]
+        return tuple(totals)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_org = x
+        original_spatial = x.shape[2:]
+        pad_values: list[int] = []
+        needs_padding = False
+
+        for size, multiple in zip(reversed(original_spatial), reversed(self.required_multiples)):
+            remainder = size % multiple
+            pad_after = (multiple - remainder) % multiple
+            pad_values.extend([0, pad_after])
+            needs_padding = needs_padding or pad_after > 0
+
+        if needs_padding:
+            x = F.pad(x, pad_values)
+
+        out = self.network(x)
+
+        if needs_padding:
+            slices = [slice(None), slice(None)]
+            for size in original_spatial:
+                slices.append(slice(0, size))
+            out = out[tuple(slices)]
+
+        if self.add_last:
+            out = out + x_org
+        return out

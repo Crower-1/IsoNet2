@@ -88,22 +88,21 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
        
     n_workers = max(training_params["ncpus"] // world_size, 1)
 
+    resample_coords_each_epoch = bool(training_params.get("resample_coords_each_epoch", False))
+    if resample_coords_each_epoch and not hasattr(train_dataset, "resample_coords"):
+        resample_coords_each_epoch = False
+
     if world_size > 1:
         dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
         torch.cuda.set_device(rank)
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = model.to(rank)
-        model = DDP(model, device_ids=[rank])
-        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=batch_size_gpu, persistent_workers=True,
-            num_workers=n_workers, pin_memory=True, sampler=train_sampler)
+        find_unused = bool(training_params.get("ddp_find_unused_parameters", False))
+        if not find_unused and training_params.get("arch") in {"nnunet", "nnunet-default"}:
+            find_unused = True
+        model = DDP(model, device_ids=[rank], find_unused_parameters=find_unused)
     else:
         model = model.to(rank)
-        train_sampler = None
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=batch_size_gpu, persistent_workers=True,
-            num_workers=n_workers, pin_memory=True, sampler=train_sampler, shuffle=True)
 
     if training_params['compile_model'] == True:
         if torch.__version__ >= "2.0.0":
@@ -121,14 +120,33 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
     if training_params['mixed_precision']:
         scaler = GradScaler()
 
+    def build_train_loader():
+        if world_size > 1:
+            train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset, batch_size=batch_size_gpu, persistent_workers=not resample_coords_each_epoch,
+                num_workers=n_workers, pin_memory=True, sampler=train_sampler)
+        else:
+            train_sampler = None
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset, batch_size=batch_size_gpu, persistent_workers=not resample_coords_each_epoch,
+                num_workers=n_workers, pin_memory=True, sampler=train_sampler, shuffle=True)
+        return train_sampler, train_loader
+
+    if not resample_coords_each_epoch:
+        train_sampler, train_loader = build_train_loader()
+
     steps_per_epoch_train = training_params['steps_per_epoch']
-    total_steps = min(len(train_loader)//training_params['acc_batches'], training_params['steps_per_epoch'])
 
     for epoch in range(training_params['epochs']):
+        if resample_coords_each_epoch and hasattr(train_dataset, "resample_coords"):
+            train_dataset.resample_coords()
+            train_sampler, train_loader = build_train_loader()
         if train_sampler:
             train_sampler.set_epoch(epoch)
         model.train()
         optimizer.zero_grad() 
+        total_steps = min(len(train_loader)//training_params['acc_batches'], steps_per_epoch_train)
         with tqdm(total=total_steps, unit=" batch", disable=(rank!=0),desc=f"Epoch {epoch+1}") as progress_bar:
             # have to convert to tensor because reduce needed it
             average_loss = torch.tensor(0, dtype=torch.float).to(rank)
@@ -444,4 +462,3 @@ def ddp_predict(rank, world_size, port_number, model, data, tmp_data_path, F_mas
     if world_size > 1:
         dist.barrier()
         dist.destroy_process_group()
-

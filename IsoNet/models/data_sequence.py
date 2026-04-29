@@ -110,6 +110,8 @@ class Train_sets_n2n(Dataset):
         self.coords = []
         self.mean = []
         self.std = []
+        self.tomo_shapes = []
+        self.mask_paths = []
 
         self.upperbounds = []
         self.lowerbounds = []
@@ -141,13 +143,15 @@ class Train_sets_n2n(Dataset):
         for _, row in tqdm(self.star.iterrows(), total=len(self.star), desc="Preprocess tomograms", ncols=100):
             if 'rlnGroundTruth' in row and row['rlnGroundTruth'] not in [None, "None"]:
                 self.has_groundtruth = True
-            mask = self._load_statistics_and_mask(row, column_name_list)
+            mask, mask_path, tomo_shape = self._load_statistics_and_mask(row, column_name_list)
+            self.mask_paths.append(mask_path)
+            self.tomo_shapes.append(tomo_shape)
             if 'rlnBoxFile' not in row or row['rlnBoxFile'] in [None, "None"]:
                 n_samples = row['rlnNumberSubtomo']
                 if self.split in ["top", "bottom"]:
                     n_samples = n_samples // 2
                 self.n_samples_per_tomo.append(n_samples)
-                coords = self.create_random_coords(mask.shape, mask, n_samples)
+                coords = self.create_random_coords(tomo_shape, mask, n_samples)
             else:
                 coords = np.loadtxt(row['rlnBoxFile'], dtype=int)[:, [2, 1, 0]]
                 self.n_samples_per_tomo.append(len(coords))
@@ -165,6 +169,9 @@ class Train_sets_n2n(Dataset):
             self.wiener_list.append(wiener_vol)
             self.CTF_list.append(CTF_vol)
 
+
+    def _is_valid_path(self, value):
+        return value not in [None, "None"] and value == value
 
     def _load_statistics_and_mask(self, row, column_name_list):
         """Load tomogram data and corresponding mask."""
@@ -201,12 +208,14 @@ class Train_sets_n2n(Dataset):
 
         # self.upperbounds.append([upper_evn, upper_odd])
         # self.lowerbounds.append([lower_evn, lower_odd])
-        if "rlnMaskName" not in column_name_list or row.get("rlnMaskName") in [None, "None"]:
-            mask = np.ones(tomo_shape, dtype=np.float32)
-        else:
-            mask, _ = read_mrc(row["rlnMaskName"])
+        mask_path = row.get("rlnMaskName") if "rlnMaskName" in column_name_list else None
+        if self._is_valid_path(mask_path):
+            mask, _ = read_mrc(mask_path)
             mask = mask.copy()
-        return mask
+        else:
+            mask_path = None
+            mask = None
+        return mask, mask_path, tomo_shape
 
     def create_random_coords(self, shape, mask, n_samples):
         """
@@ -214,28 +223,70 @@ class Train_sets_n2n(Dataset):
         """
         z_max, y_max, x_max = shape
         half_size = self.cube_size // 2
-        
-        mask[:half_size,:,:] = 0
-        mask[z_max-half_size:z_max,:,:] = 0
-        mask[:, :half_size, :] = 0
-        mask[:, y_max-half_size:, :] = 0
-        mask[:,:,:half_size] = 0
-        mask[:,:,x_max-half_size:x_max] = 0
+
+        z_min = half_size
+        z_max_exclusive = z_max - half_size
+        y_min = half_size
+        y_max_exclusive = y_max - half_size
+        x_min = half_size
+        x_max_exclusive = x_max - half_size
 
         half_y = y_max // 2
         if self.split == "top":
-            mask[:,half_y:y_max,:] = 0
+            y_min = max(y_min, half_y)
         elif self.split == "bottom":
-            mask[:,0:half_y,:] = 0
+            y_max_exclusive = min(y_max_exclusive, half_y)
 
-        # Flatten the mask and randomly sample indices
+        if mask is None:
+            if z_min >= z_max_exclusive or y_min >= y_max_exclusive or x_min >= x_max_exclusive:
+                raise ValueError("Invalid sampling region after applying cube_size and split constraints.")
+            z_coords = np.random.randint(z_min, z_max_exclusive, n_samples)
+            y_coords = np.random.randint(y_min, y_max_exclusive, n_samples)
+            x_coords = np.random.randint(x_min, x_max_exclusive, n_samples)
+            return np.stack([z_coords, y_coords, x_coords], axis=1)
 
-        valid_indices = np.flatnonzero(mask)  # Get indices of non-zero elements
+        mask = mask.copy()
+        mask[:half_size, :, :] = 0
+        mask[z_max-half_size:z_max, :, :] = 0
+        mask[:, :half_size, :] = 0
+        mask[:, y_max-half_size:, :] = 0
+        mask[:, :, :half_size] = 0
+        mask[:, :, x_max-half_size:x_max] = 0
+
+        if self.split == "top":
+            mask[:, half_y:y_max, :] = 0
+        elif self.split == "bottom":
+            mask[:, 0:half_y, :] = 0
+
+        valid_indices = np.flatnonzero(mask)
         if len(valid_indices) < n_samples:
             raise ValueError("Not enough valid positions in the mask to sample.")
         sampled_indices = valid_indices[np.random.randint(0, len(valid_indices), n_samples)]
         rand_coords = np.array(np.unravel_index(sampled_indices, shape)).T
         return rand_coords
+
+    def resample_coords(self):
+        """Resample random coordinates for each tomogram."""
+        self.coords = []
+        self.n_samples_per_tomo = []
+        for idx, row in self.star.iterrows():
+            box_file = row.get("rlnBoxFile")
+            if self._is_valid_path(box_file):
+                coords = np.loadtxt(box_file, dtype=int)[:, [2, 1, 0]]
+                n_samples = len(coords)
+            else:
+                n_samples = row['rlnNumberSubtomo']
+                if self.split in ["top", "bottom"]:
+                    n_samples = n_samples // 2
+                mask = None
+                mask_path = self.mask_paths[idx] if idx < len(self.mask_paths) else None
+                if self._is_valid_path(mask_path):
+                    mask, _ = read_mrc(mask_path)
+                coords = self.create_random_coords(self.tomo_shapes[idx], mask, n_samples)
+            self.n_samples_per_tomo.append(n_samples)
+            self.coords.append(coords)
+        self.length = sum(self.n_samples_per_tomo)
+        self.cumulative_samples = np.cumsum(self.n_samples_per_tomo)
 
         # valid_inds = np.where(mask)
         # sample_inds = np.random.choice(len(valid_inds[0]), n_samples, replace=(len(valid_inds[0]) < n_samples))

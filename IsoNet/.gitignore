@@ -5,3 +5,4 @@ __pycache__/
 particles.txt
 ../note.txt
 .*
+settings.json

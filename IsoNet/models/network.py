@@ -20,31 +20,38 @@ def get_num_parameters(model):
     return sum(p.numel() for p in model.parameters())
 
 class Net:
-    def __init__(self, method=None, arch = 'unet-default', cube_size = 96, pretrained_model=None, state="train"):
+    def __init__(self, method=None, arch = 'unet-default', cube_size = 96, pretrained_model=None, state="train", add_last=None):
         self.state = state
         if pretrained_model != None and pretrained_model != "None":
             self.load(pretrained_model)
         else:
-            self.initialize(method, arch,cube_size)
+            self.initialize(method, arch, cube_size, add_last=add_last)
             self.metrics = {"average_loss":[],
                        "inside_loss":[],
                        "outside_loss":[]}
         if state == "train":
             torch.backends.cudnn.benchmark = True    
     
-    def initialize(self, method='regular', arch = 'unet-medium', cube_size = 96):
+    def initialize(self, method='regular', arch = 'unet-medium', cube_size = 96, add_last=None):
         self.arch = arch
         self.method = method
         self.cube_size = cube_size
         if self.arch == 'unet-large':
             from .unet import Unet
-            self.model = Unet(filter_base = 64,unet_depth=4, add_last=True)
+            add_last_value = True if add_last is None else add_last
+            self.model = Unet(filter_base = 64,unet_depth=4, add_last=add_last_value)
         elif self.arch == 'unet-medium':
             from .unet import Unet
-            self.model = Unet(filter_base = 32,unet_depth=4, add_last=True)
+            add_last_value = True if add_last is None else add_last
+            self.model = Unet(filter_base = 32,unet_depth=4, add_last=add_last_value)
         elif self.arch == 'unet-small':
             from .unet import Unet
-            self.model = Unet(filter_base = 16,unet_depth=4, add_last=True)
+            add_last_value = True if add_last is None else add_last
+            self.model = Unet(filter_base = 16,unet_depth=4, add_last=add_last_value)
+        elif self.arch in ['nnunet', 'nnunet-default']:
+            from .nnUNet import NNUNet
+            add_last_value = False if add_last is None else add_last
+            self.model = NNUNet(add_last=add_last_value)
 
         elif self.arch in ['scunet-large','scunet-medium','scunet-small','scunet-fast','scunet-fast-large']:
             if self.state == "train":
@@ -97,7 +104,7 @@ class Net:
                 self.model.apply(self.model._init_weights)
 
         else:
-            logging.info(f"method {method} should be either unet-default, unet-small,unet-medium,HSFormer" )
+            logging.info(f"method {method} should be either unet-default, unet-small, unet-medium, nnunet, scunet-fast, HSFormer" )
         # elif self.arch == 'HSFormer':
         #     from IsoNet.models.HSFormer import swin_tiny_patch4_window8
         #     self.model = swin_tiny_patch4_window8(img_size=cube_size, embed_dim=128,num_classes =1)

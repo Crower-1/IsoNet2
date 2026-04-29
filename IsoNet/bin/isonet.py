@@ -2,6 +2,13 @@
 import fire
 import logging
 import os, sys
+
+# Ensure the project root is on sys.path so running the script from any folder
+# can still import the IsoNet package.
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+    
 from IsoNet.utils.dict2attr import check_parse
 from fire import core
 import starfile
@@ -455,6 +462,7 @@ class ISONET:
 
                    arch: str='unet-medium',
                    pretrained_model: str=None,
+                   add_last: bool=True,
 
                    cube_size: int=96,
                    epochs: int=50,
@@ -486,8 +494,9 @@ class ISONET:
             output_dir: Directory to save trained model and results. 
             gpuID: GPU IDs to use during training (e.g., "0,1,2,3"). 
             ncpus: Number of CPUs to use for data processing. 
-            arch: Network architecture string (e.g., unet-small, unet-medium, unet-large). Determines model capacity and VRAM requirements. 
+            arch: Network architecture string (e.g., unet-small, unet-medium, unet-large, nnunet). Determines model capacity and VRAM requirements. 
             pretrained_model: Path to pretrained model to continue training. Previous method, arch, cube_size, CTF_mode, and metrics will be loaded. 
+            add_last: If True, add the input volume to the network output (residual). If None, defaults to True for unet and False for nnunet. 
             cube_size: Size in voxels of training subvolumes. Must be compatible with the network (divisible by the network downsampling factors). 
             epochs: Number of training epochs. 
             batch_size: Number of subtomograms per optimization step; if "auto", this is automatically determined by multiplying the number of available GPUs by 2. If the number of GPUs is 1, batch size is 4. Batch size per GPU matters for gradient stability. 
@@ -548,7 +557,7 @@ class ISONET:
 
         training_params['split'] = "full"
         from IsoNet.models.network import Net
-        network = Net(method='n2n', arch=arch, cube_size=cube_size, pretrained_model=pretrained_model,state='train')
+        network = Net(method='n2n', arch=arch, cube_size=cube_size, pretrained_model=pretrained_model, state='train', add_last=add_last)
         network.prepare_train_dataset(training_params)
         if with_preview:
             new_epochs = save_interval
@@ -576,6 +585,7 @@ class ISONET:
                    method: str="auto",
                    arch: str='unet-medium',
                    pretrained_model: str=None,
+                   add_last: bool=True,
 
                    cube_size: int=96,
                    epochs: int=50,
@@ -602,6 +612,8 @@ class ISONET:
 
                    random_rot_weight: float=0.2,
 
+                   resample_coords_each_epoch: bool=True,
+
                    with_preview: bool=True,
                    prev_tomo_idx:str=1,
 
@@ -618,8 +630,9 @@ class ISONET:
             gpuID: GPU IDs to use during training (e.g., "0,1,2,3"). 
             ncpus: Number of CPUs to use for data processing. 
             method: "isonet2" for single-map missing-wedge correction, "isonet2-n2n" for noise2noise when even/odd halves are present. If omitted, the code auto-detects the method from the STAR columns. 
-            arch: Network architecture string (e.g., unet-small, unet-medium, unet-large, scunet-fast). Determines model capacity and VRAM requirements. 
+            arch: Network architecture string (e.g., unet-small, unet-medium, unet-large, scunet-fast, nnunet). Determines model capacity and VRAM requirements. 
             pretrained_model: Path to pretrained model to continue training. Previous method, arch, cube_size, CTF_mode, and metrics will be loaded. 
+            add_last: If True, add the input volume to the network output (residual). If None, defaults to True for unet and False for nnunet. 
             cube_size: Size in voxels of training subvolumes. Must be compatible with the network (divisible by the network downsampling factors). 
             epochs: Number of training epochs. 
             input_column: Column name in STAR file to use as input tomograms. 
@@ -639,7 +652,8 @@ class ISONET:
             noise_level: Adds artificial noise during training. 
             noise_mode: Controls filter applied when generating synthetic noise (None, ramp, hamming). 
             random_rot_weight: Percentage of rotations applied as random augmentation. 2.
-            with_preview: If True, run prediction using the final checkpoint(s) after training. 
+            resample_coords_each_epoch: If True, resample subtomogram coordinates at the start of each epoch.
+            /: If True, run prediction using the final checkpoint(s) after training. 
             prev_tomo_idx: If set, automatically predict only the tomograms listed by these indices (e.g., "1,2,4" or "5-10,15,16"). 
             snrfalloff: Controls frequency-dependent SNR attenuation applied during deconvolution; larger values reduce high-frequency contribution more aggressively and can stabilize deconvolution on noisy data; smaller values preserve more high-frequency content but risk amplifying noise. 
             deconvstrength: Scalar multiplier for deconvolution strength; increasing this emphasizes correction and low-frequency recovery but can introduce ringing/artifacts if set too high. 0.
@@ -734,12 +748,13 @@ class ISONET:
             "random_rot_weight":random_rot_weight,
             'do_phaseflip_input':do_phaseflip_input,
             "clip_first_peak_mode":clip_first_peak_mode,
-            "bfactor": bfactor
+            "bfactor": bfactor,
+            "resample_coords_each_epoch": resample_coords_each_epoch
         }
 
         training_params['split'] = "full"
         from IsoNet.models.network import Net
-        network = Net(method=method, arch=arch, cube_size=cube_size, pretrained_model=pretrained_model,state='train')
+        network = Net(method=method, arch=arch, cube_size=cube_size, pretrained_model=pretrained_model, state='train', add_last=add_last)
         network.prepare_train_dataset(training_params)
         if with_preview:
             new_epochs = save_interval
