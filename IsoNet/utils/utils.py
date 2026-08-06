@@ -5,6 +5,24 @@ from tqdm import tqdm
 import os
 import linecache
 import pathlib
+import numbers
+
+def normalize_tomo_idx(value):
+    if isinstance(value, str):
+        value = value.strip()
+        try:
+            numeric_value = float(value)
+        except ValueError:
+            return value
+    else:
+        numeric_value = value
+
+    if isinstance(numeric_value, numbers.Real) and not isinstance(numeric_value, bool):
+        numeric_value = float(numeric_value)
+        if numeric_value.is_integer():
+            return str(int(numeric_value))
+
+    return str(value)
     
 def process_tomograms(star_path, output_dir, idx_str, desc, row_processor):
     linecache.clearcache()
@@ -12,11 +30,18 @@ def process_tomograms(star_path, output_dir, idx_str, desc, row_processor):
     star = starfile.read(star_path)
     new_star = star.copy()
     idx_list = idx2list(idx_str, star.rlnIndex)
+    available_idx = {normalize_tomo_idx(idx) for idx in star.rlnIndex}
+    missing_idx = sorted(set(idx_list) - available_idx, key=lambda idx: int(idx) if idx.isdigit() else idx)
+    if missing_idx:
+        raise ValueError(
+            f"{desc}: tomo_idx {', '.join(missing_idx)} not found in {star_path}. "
+            f"Available rlnIndex values: {', '.join(sorted(available_idx, key=lambda idx: int(idx) if idx.isdigit() else idx))}"
+        )
     os.makedirs(output_dir, exist_ok=True)
 
     with tqdm(total=len(idx_list), desc=desc, unit='tomogram') as pbar:
         for i, row in star.iterrows():
-            if str(row.rlnIndex) in idx_list:
+            if normalize_tomo_idx(row.rlnIndex) in idx_list:
                 print()
                 row_processor(i, row, new_star)
                 pbar.update(1)
@@ -130,9 +155,9 @@ def parse_params(batch_size_in, gpuID_in, ncpus_in, fit_ncpus_to_ngpus= False):
 def idx2list(tomo_idx, all_tomo_idx):
     if tomo_idx not in  [None, "None", "all", "All"]:
         if type(tomo_idx) is tuple:
-            tomo_idx = list(map(str,tomo_idx))
+            tomo_idx = [normalize_tomo_idx(idx) for idx in tomo_idx]
         elif type(tomo_idx) is int:
-            tomo_idx = [str(tomo_idx)]
+            tomo_idx = [normalize_tomo_idx(tomo_idx)]
         else:
             txt=str(tomo_idx)
             txt=txt.replace(',',' ').split()
@@ -141,11 +166,11 @@ def idx2list(tomo_idx, all_tomo_idx):
                 if everything.find("-")!=-1:
                     everything=everything.split("-")
                     for e in range(int(everything[0]),int(everything[1])+1):
-                        tomo_idx.append(str(e))
+                        tomo_idx.append(normalize_tomo_idx(e))
                 else:
-                    tomo_idx.append(str(everything))
+                    tomo_idx.append(normalize_tomo_idx(everything))
     else:
-        tomo_idx = [str(i) for i in all_tomo_idx]
+        tomo_idx = [normalize_tomo_idx(i) for i in all_tomo_idx]
     return tomo_idx
 
 
