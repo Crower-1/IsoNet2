@@ -6,8 +6,9 @@ import os, sys
 # Ensure the project root is on sys.path so running the script from any folder
 # can still import the IsoNet package.
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+if PROJECT_ROOT in sys.path:
+    sys.path.remove(PROJECT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
     
 from IsoNet.utils.dict2attr import check_parse
 from fire import core
@@ -588,6 +589,11 @@ class ISONET:
                    method: str="auto",
                    arch: str='unet-medium',
                    pretrained_model: str=None,
+                   encoder_pretrained: str=None,
+                   encoder_trainable: str="all",
+                   encoder_learning_rate: float=None,
+                   decoder_learning_rate: float=None,
+                   encoder_input_sign: float=-1.0,
                    add_last: bool=True,
 
                    cube_size: int=96,
@@ -635,6 +641,11 @@ class ISONET:
             method: "isonet2" for single-map missing-wedge correction, "isonet2-n2n" for noise2noise when even/odd halves are present. If omitted, the code auto-detects the method from the STAR columns. 
             arch: Network architecture string (e.g., unet-small, unet-medium, unet-large, scunet-fast, nnunet). Determines model capacity and VRAM requirements. 
             pretrained_model: Path to pretrained model to continue training. Previous method, arch, cube_size, CTF_mode, and metrics will be loaded. 
+            encoder_pretrained: nnSSL ResEncL checkpoint or compact converted encoder checkpoint. Only valid with arch=resencl-restoration; unlike pretrained_model, this imports only encoder weights.
+            encoder_trainable: ResEncL fine-tuning scope: "frozen", "deep" (stages 3-5), or "all".
+            encoder_learning_rate: Learning rate for trainable ResEncL encoder parameters. Defaults to learning_rate.
+            decoder_learning_rate: Learning rate for the restoration decoder and output head. Defaults to learning_rate.
+            encoder_input_sign: Sign applied only before the ResEncL encoder. Use -1 for the supplied nnSSL checkpoint because its raw-data Z-score polarity is opposite to IsoNet2's inverted Z-score convention.
             add_last: If True, add the input volume to the network output (residual). If None, defaults to True for unet and False for nnunet. 
             cube_size: Size in voxels of training subvolumes. Must be compatible with the network (divisible by the network downsampling factors). 
             epochs: Number of training epochs. 
@@ -698,6 +709,15 @@ class ISONET:
                 noise_dir = f"{output_dir}/noise_volumes"
                 # Note: the angle for this noise generation is range(-90,90,3)
                 make_noise_folder(noise_dir,noise_mode,cube_size,num_noise_volume,ncpus=ncpus)
+
+        if encoder_pretrained not in [None, "None", ""] and arch != "resencl-restoration":
+            raise ValueError("encoder_pretrained requires --arch resencl-restoration")
+        if arch == "resencl-restoration" and cube_size % 32 != 0:
+            raise ValueError("resencl-restoration requires cube_size divisible by 32")
+        if str(encoder_trainable).lower() not in ["frozen", "deep", "all"]:
+            raise ValueError("encoder_trainable must be one of: frozen, deep, all")
+        if float(encoder_input_sign) not in [-1.0, 1.0]:
+            raise ValueError("encoder_input_sign must be either -1 or +1")
  
         if with_deconv:
             self.deconv(star_file=star_file,
@@ -731,6 +751,9 @@ class ISONET:
             "epochs": epochs,
             "steps_per_epoch":steps_per_epoch,
             "learning_rate":learning_rate,
+            "encoder_trainable":str(encoder_trainable).lower(),
+            "encoder_learning_rate":encoder_learning_rate,
+            "decoder_learning_rate":decoder_learning_rate,
             "cube_size": cube_size,
             "mw_weight": mw_weight,
             'apply_mw_x1':apply_mw_x1,
@@ -757,7 +780,26 @@ class ISONET:
 
         training_params['split'] = "full"
         from IsoNet.models.network import Net
-        network = Net(method=method, arch=arch, cube_size=cube_size, pretrained_model=pretrained_model, state='train', add_last=add_last)
+        network = Net(method=method, arch=arch, cube_size=cube_size,
+                      pretrained_model=pretrained_model, encoder_pretrained=encoder_pretrained,
+                      encoder_input_sign=encoder_input_sign, state='train', add_last=add_last)
+        transfer_report = getattr(network, "encoder_transfer_report", None)
+        if transfer_report and transfer_report.get("pretrain_spacing") and "rlnPixelSize" in star:
+            source_pixel_size = float(np.mean(transfer_report["pretrain_spacing"]))
+            target_pixel_sizes = np.asarray(star["rlnPixelSize"], dtype=float)
+            scale_ratios = np.maximum(
+                target_pixel_sizes / source_pixel_size,
+                source_pixel_size / target_pixel_sizes,
+            )
+            logging.info(
+                "ResEncL physical scale: pretrain %.3f A/voxel; target %.3f-%.3f A/voxel",
+                source_pixel_size, target_pixel_sizes.min(), target_pixel_sizes.max()
+            )
+            if np.max(scale_ratios) > 1.5:
+                logging.warning(
+                    "Target voxel size differs from nnSSL pretraining by more than 1.5x; "
+                    "prefer full encoder fine-tuning."
+                )
         network.prepare_train_dataset(training_params)
         if with_preview:
             new_epochs = save_interval

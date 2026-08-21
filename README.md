@@ -507,7 +507,7 @@ Use refine for _IsoNet2_ missing-wedge correction (isonet2) or isonet2-n2n combi
 - `star_file` — Input STAR listing tomograms and acquisition metadata. Required parameter.
 
 - `apply_mw_x1` — Whether to apply missing wedge to subtomograms at the beginning. Default: `True`.
-- `arch` — Network architecture string (e.g., unet-small, unet-medium, unet-large, scunet-fast). Determines model capacity and VRAM requirements. Default: `"unet-medium"`.
+- `arch` — Network architecture string (e.g., unet-small, unet-medium, unet-large, scunet-fast, resencl-restoration). `resencl-restoration` is a six-stage ResEncL encoder with an nnU-Net-style transposed-convolution restoration decoder and requires every cube dimension to be divisible by 32. Default: `"unet-medium"`.
 - `batch_size` — Number of subtomograms per optimization step; if None, this is automatically determined by multiplying the number of available GPUs by 2. If the number of GPUs is 1, batch size is 4. Batch size per GPU matters for gradient stability. Default: `None`.
 - `bfactor` — B-factor applied during training/prediction to boost high-frequency content. For cellular tomograms we recommend a b-factor of 0. For isolated samples, you can use a b-factor from 200–300. Default: **0**.
 - `clip_first_peak_mode` — Controls attenuation of overrepresented very-low-frequency CTF peak. Options 2 and 3 might increase low-resolution contrast. Default: **1**.
@@ -540,6 +540,11 @@ Use refine for _IsoNet2_ missing-wedge correction (isonet2) or isonet2-n2n combi
 - `output_dir` — Directory to save trained model and results. Default: `"isonet_maps"`.
 - `prev_tomo_idx` — If set, automatically predict only the tomograms listed by these indices (e.g., "1,2,4" or "5-10,15,16"). Default: **1**.
 - `pretrained_model` — Path to pretrained model to continue training. Previous method, arch, cube_size, CTF_mode, and metrics will be loaded. Default: `None`.
+- `encoder_pretrained` — nnSSL ResEncL checkpoint, or a compact checkpoint produced by `python -m IsoNet.models.nnssl_encoder_import`. Imports only the encoder and requires `arch=resencl-restoration`. Default: `None`.
+- `encoder_trainable` — ResEncL fine-tuning scope: `frozen`, `deep` (stages 3–5), or `all`. Default: `all`.
+- `encoder_learning_rate` — Learning rate for trainable ResEncL encoder parameters; defaults to `learning_rate`.
+- `decoder_learning_rate` — Learning rate for the restoration decoder and output head; defaults to `learning_rate`.
+- `encoder_input_sign` — Sign applied only at the ResEncL encoder input. The validated nnSSL WBP checkpoint uses `-1`, because nnSSL's raw Z-score polarity is opposite to IsoNet2's inverted input convention. Default: **-1**.
 - `random_rot_weight` — Percentage of rotations applied as random augmentation. Default: **0.2**.
 - `save_interval` — Interval to save model checkpoints. Default: **10**.
 - `snrfalloff` — Controls frequency-dependent SNR attenuation applied during deconvolution; larger values reduce high-frequency contribution more aggressively and can stabilize deconvolution on noisy data; smaller values preserve more high-frequency content but risk amplifying noise. Default: **0**.
@@ -547,6 +552,35 @@ Use refine for _IsoNet2_ missing-wedge correction (isonet2) or isonet2-n2n combi
 
 ![](./IsoNet/tutorial_figures/CTF_b_factor.png)
 Fig. 5. Effects of clip_first_peak_mode and bfactor on CTF.
+
+### nnSSL ResEncL transfer
+
+Convert a source checkpoint once if a compact encoder-only file is preferred:
+
+```bash
+python -m IsoNet.models.nnssl_encoder_import checkpoint_latest.pth resencl_encoder_latest.pt
+```
+
+The three recommended fine-tuning phases are separate `refine` runs. Continue phases 2 and 3 with the full IsoNet2 checkpoint via `pretrained_model`; use `encoder_pretrained` only in phase 1:
+
+```bash
+# Phase 1: decoder only
+isonet.py refine tomograms.star --method isonet2 --arch resencl-restoration \
+  --encoder_pretrained resencl_encoder_latest.pt --encoder_trainable frozen \
+  --decoder_learning_rate 3e-4 --epochs 10 --with_preview False
+
+# Phase 2: stages 3-5 plus decoder
+isonet.py refine tomograms.star --method isonet2 --arch resencl-restoration \
+  --pretrained_model isonet_maps/network_isonet2_resencl-restoration_96_full.pt \
+  --encoder_trainable deep --encoder_learning_rate 1e-5 \
+  --decoder_learning_rate 1e-4 --epochs 20 --with_preview False
+
+# Phase 3: full fine-tuning
+isonet.py refine tomograms.star --method isonet2 --arch resencl-restoration \
+  --pretrained_model isonet_maps/network_isonet2_resencl-restoration_96_full.pt \
+  --encoder_trainable all --encoder_learning_rate 3e-6 \
+  --decoder_learning_rate 3e-5 --epochs 40 --with_preview False
+```
 
 ### Practical notes
 

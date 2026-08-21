@@ -20,19 +20,40 @@ def get_num_parameters(model):
     return sum(p.numel() for p in model.parameters())
 
 class Net:
-    def __init__(self, method=None, arch = 'unet-default', cube_size = 96, pretrained_model=None, state="train", add_last=None):
+    def __init__(self, method=None, arch = 'unet-default', cube_size = 96, pretrained_model=None,
+                 encoder_pretrained=None, encoder_input_sign=-1.0, state="train", add_last=None):
         self.state = state
         if pretrained_model != None and pretrained_model != "None":
+            if encoder_pretrained not in [None, "None", ""]:
+                raise ValueError("Use either pretrained_model or encoder_pretrained, not both.")
             self.load(pretrained_model)
         else:
-            self.initialize(method, arch, cube_size, add_last=add_last)
+            self.initialize(method, arch, cube_size, add_last=add_last,
+                            encoder_input_sign=encoder_input_sign)
+            if encoder_pretrained not in [None, "None", ""]:
+                if arch != "resencl-restoration":
+                    raise ValueError("encoder_pretrained requires arch='resencl-restoration'.")
+                from .nnssl_encoder_import import load_encoder_pretrained
+                self.encoder_transfer_report = load_encoder_pretrained(
+                    self.model.encoder, encoder_pretrained
+                )
+                logging.info(
+                    "Loaded nnSSL ResEncL encoder: %s parameters, stem=%s, stages=%s, "
+                    "source_epoch=%s, pretrain_spacing=%s",
+                    f"{self.encoder_transfer_report['parameter_count']:,}",
+                    self.encoder_transfer_report["stem_loaded"],
+                    self.encoder_transfer_report["stages_loaded"],
+                    self.encoder_transfer_report.get("source_epoch"),
+                    self.encoder_transfer_report.get("pretrain_spacing"),
+                )
             self.metrics = {"average_loss":[],
                        "inside_loss":[],
                        "outside_loss":[]}
         if state == "train":
             torch.backends.cudnn.benchmark = True    
     
-    def initialize(self, method='regular', arch = 'unet-medium', cube_size = 96, add_last=None):
+    def initialize(self, method='regular', arch = 'unet-medium', cube_size = 96, add_last=None,
+                   encoder_input_sign=-1.0):
         self.arch = arch
         self.method = method
         self.cube_size = cube_size
@@ -52,6 +73,16 @@ class Net:
             from .nnUNet import NNUNet
             add_last_value = False if add_last is None else add_last
             self.model = NNUNet(add_last=add_last_value)
+
+        elif self.arch == 'resencl-restoration':
+            if cube_size % 32 != 0:
+                raise ValueError(
+                    f"resencl-restoration requires cube_size divisible by 32, got {cube_size}"
+                )
+            from .resencl import ResEncLRestorationNet
+            self.model = ResEncLRestorationNet(
+                in_channels=1, out_channels=1, encoder_input_sign=encoder_input_sign
+            )
 
         elif self.arch in ['scunet-large','scunet-medium','scunet-small','scunet-fast','scunet-fast-large']:
             if self.state == "train":

@@ -13,6 +13,7 @@ from IsoNet.utils.plot_metrics import plot_metrics
 from IsoNet.utils.rotations import rotation_list, sample_rot_axis_and_angle, rotate_vol_around_axis_torch
 import torch.optim.lr_scheduler as lr_scheduler
 import shutil
+import math
 from packaging import version
 from scipy.stats import linregress
 if version.parse(torch.__version__) >= version.parse("2.3.0"):
@@ -81,6 +82,62 @@ def process_batch(batch):
         return [b.cuda() for b in batch]
     return batch[0].cuda(), batch[1].cuda(), None, None, None, None, None
 
+
+def _unwrap_model(model):
+    return model.module if isinstance(model, DDP) else model
+
+
+def build_optimizer(model, training_params):
+    """Build AdamW, with ResEncL encoder/restoration parameter groups when available."""
+    base_model = _unwrap_model(model)
+    learning_rate = training_params['learning_rate']
+
+    if hasattr(base_model, 'set_encoder_trainable'):
+        encoder_trainable = training_params.get('encoder_trainable', 'all')
+        base_model.set_encoder_trainable(encoder_trainable)
+        encoder_lr = training_params.get('encoder_learning_rate')
+        decoder_lr = training_params.get('decoder_learning_rate')
+        encoder_lr = learning_rate if encoder_lr in [None, "None", ""] else float(encoder_lr)
+        decoder_lr = learning_rate if decoder_lr in [None, "None", ""] else float(decoder_lr)
+
+        encoder_parameters = [p for p in base_model.encoder_parameters() if p.requires_grad]
+        restoration_parameters = [p for p in base_model.restoration_parameters() if p.requires_grad]
+        parameter_groups = []
+        if encoder_parameters:
+            parameter_groups.append({
+                'params': encoder_parameters,
+                'lr': encoder_lr,
+                'group_name': 'encoder',
+            })
+        if restoration_parameters:
+            parameter_groups.append({
+                'params': restoration_parameters,
+                'lr': decoder_lr,
+                'group_name': 'restoration',
+            })
+        if not parameter_groups:
+            raise ValueError("No trainable parameters remain after applying encoder_trainable")
+        return torch.optim.AdamW(parameter_groups, lr=learning_rate)
+
+    return torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=learning_rate)
+
+
+def build_scheduler(optimizer, training_params):
+    """Cosine schedule that preserves differential learning-rate ratios."""
+    base_lr = float(training_params['learning_rate'])
+    minimum_lr = float(training_params['learning_rate_min'])
+    minimum_factor = minimum_lr / base_lr if base_lr > 0 else 1.0
+    t_max = int(training_params['T_max'])
+    if t_max <= 0:
+        raise ValueError("T_max must be positive")
+
+    def lr_factor(epoch):
+        return minimum_factor + (1.0 - minimum_factor) * (
+            1.0 + math.cos(math.pi * epoch / t_max)
+        ) / 2.0
+
+    return lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_factor)
+
 def ddp_train(rank, world_size, port_number, model, train_dataset, training_params):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = port_number
@@ -91,6 +148,10 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
     resample_coords_each_epoch = bool(training_params.get("resample_coords_each_epoch", False))
     if resample_coords_each_epoch and not hasattr(train_dataset, "resample_coords"):
         resample_coords_each_epoch = False
+
+    # DDP must see the final requires_grad set while it registers reducer hooks.
+    if hasattr(model, 'set_encoder_trainable'):
+        model.set_encoder_trainable(training_params.get('encoder_trainable', 'all'))
 
     if world_size > 1:
         dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
@@ -111,8 +172,8 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
                 torch.set_float32_matmul_precision('high')
                 model = torch.compile(model)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=training_params['learning_rate'])
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_params['T_max'], eta_min=training_params['learning_rate_min'])
+    optimizer = build_optimizer(model, training_params)
+    scheduler = build_scheduler(optimizer, training_params)
 
     loss_funcs = {"L2": nn.MSELoss(), "Huber": nn.HuberLoss(), "L1": nn.L1Loss(), "FSC": FSCLoss()}
     loss_func = loss_funcs.get(training_params['loss_func'])
@@ -472,4 +533,3 @@ def ddp_predict(rank, world_size, port_number, model, data, tmp_data_path, F_mas
     finally:
         if world_size > 1 and dist.is_initialized():
             dist.destroy_process_group()
-
