@@ -18,6 +18,8 @@ def plot_metrics(metrics, filename, bottom=None, top=None, method=None):
             'average_loss': 'total_loss',
             'inside_loss': 'visible_loss',
             'outside_loss': 'restore_loss',
+            'power_loss': 'shell_power_loss',
+            'restore_amplitude_ratio': 'restore_amplitude_ratio',
         }
     else:
         display_names = {

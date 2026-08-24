@@ -7,6 +7,7 @@ from IsoNet.models.masked_loss import (
     fft_3d,
     ifft_3d,
     masked_fourier_shell_correlation_loss,
+    masked_fourier_shell_power_loss,
     normalized_complex_fourier_loss,
 )
 from IsoNet.models.train import prepare_isonet2_batch
@@ -108,6 +109,99 @@ def test_complex_fourier_loss_is_phase_sensitive():
     )
     assert matching == 0
     assert phase_reversed > 0
+
+
+def test_shell_power_loss_penalizes_amplitude_collapse():
+    torch.manual_seed(11)
+    target = torch.randn(2, 1, 16, 16, 16)
+    mask = torch.ones_like(target)
+
+    matching, matching_ratio = masked_fourier_shell_power_loss(
+        target,
+        target,
+        mask,
+        min_shell=1,
+        max_nyquist=1.0,
+        window_alpha=0.0,
+        return_amplitude_ratio=True,
+    )
+    half, half_ratio = masked_fourier_shell_power_loss(
+        0.5 * target,
+        target,
+        mask,
+        min_shell=1,
+        max_nyquist=1.0,
+        window_alpha=0.0,
+        return_amplitude_ratio=True,
+    )
+    collapsed = masked_fourier_shell_power_loss(
+        0.2 * target,
+        target,
+        mask,
+        min_shell=1,
+        max_nyquist=1.0,
+        window_alpha=0.0,
+    )
+
+    torch.testing.assert_close(matching, torch.zeros_like(matching))
+    torch.testing.assert_close(matching_ratio, torch.ones_like(matching_ratio))
+    torch.testing.assert_close(half_ratio, torch.full_like(half_ratio, 0.5))
+    assert matching < half < collapsed
+
+    matching_corr = masked_fourier_shell_correlation_loss(
+        target, target, mask, min_shell=1, max_nyquist=1.0, window_alpha=0.0
+    )
+    collapsed_corr = masked_fourier_shell_correlation_loss(
+        0.2 * target,
+        target,
+        mask,
+        min_shell=1,
+        max_nyquist=1.0,
+        window_alpha=0.0,
+    )
+    torch.testing.assert_close(collapsed_corr, matching_corr, atol=1e-6, rtol=1e-6)
+
+
+def test_shell_power_loss_is_scale_stable_and_has_finite_gradients():
+    torch.manual_seed(13)
+    target = torch.randn(1, 1, 14, 14, 14)
+    soft_mask = torch.rand_like(target)
+    prediction = torch.nn.Parameter(0.3 * target.clone())
+
+    loss = masked_fourier_shell_power_loss(
+        prediction,
+        target,
+        soft_mask,
+        min_shell=1,
+        max_nyquist=1.0,
+        window_alpha=0.0,
+    )
+    scaled_loss = masked_fourier_shell_power_loss(
+        7.0 * prediction,
+        7.0 * target,
+        soft_mask,
+        min_shell=1,
+        max_nyquist=1.0,
+        window_alpha=0.0,
+    )
+    torch.testing.assert_close(loss, scaled_loss, atol=1e-6, rtol=1e-6)
+
+    loss.backward()
+    assert prediction.grad is not None
+    assert torch.isfinite(prediction.grad).all()
+    assert prediction.grad.abs().sum() > 0
+
+    empty_loss, empty_ratio = masked_fourier_shell_power_loss(
+        prediction.detach(),
+        target,
+        torch.zeros_like(target),
+        min_shell=1,
+        max_nyquist=1.0,
+        window_alpha=0.0,
+        return_amplitude_ratio=True,
+    )
+    torch.testing.assert_close(empty_loss, torch.zeros_like(empty_loss))
+    torch.testing.assert_close(empty_ratio, torch.zeros_like(empty_ratio))
 
 
 def test_full_volume_data_consistency_preserves_measured_coefficients():

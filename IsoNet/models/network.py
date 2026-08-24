@@ -51,7 +51,9 @@ class Net:
                 )
             self.metrics = {"average_loss":[],
                        "inside_loss":[],
-                       "outside_loss":[]}
+                       "outside_loss":[],
+                       "power_loss":[],
+                       "restore_amplitude_ratio":[]}
         if state == "train":
             torch.backends.cudnn.benchmark = True    
     

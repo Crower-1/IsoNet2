@@ -13,6 +13,7 @@ from IsoNet.models.masked_loss import (
     masked_loss,
     apply_fourier_mask_to_tomo,
     masked_fourier_shell_correlation_loss,
+    masked_fourier_shell_power_loss,
     normalized_complex_fourier_loss,
     tukey_window_3d,
 )
@@ -247,6 +248,15 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
     if training_params['mixed_precision']:
         scaler = GradScaler()
 
+    for metric_name in ("average_loss", "inside_loss", "outside_loss"):
+        training_params["metrics"].setdefault(metric_name, [])
+    historical_epochs = len(training_params["metrics"]["average_loss"])
+    for metric_name in ("power_loss", "restore_amplitude_ratio"):
+        values = list(training_params["metrics"].get(metric_name, []))
+        if len(values) < historical_epochs:
+            values = [np.nan] * (historical_epochs - len(values)) + values
+        training_params["metrics"][metric_name] = values
+
     def build_train_loader():
         if world_size > 1:
             train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
@@ -279,9 +289,15 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
             average_loss = torch.tensor(0, dtype=torch.float).to(rank)
             average_inside_loss = torch.tensor(0, dtype=torch.float).to(rank)
             average_outside_loss = torch.tensor(0, dtype=torch.float).to(rank)
+            average_power_loss = torch.tensor(0, dtype=torch.float).to(rank)
+            average_restore_amplitude_ratio = torch.tensor(0, dtype=torch.float).to(rank)
 
             for i_batch, batch in enumerate(train_loader):  
                 x1, x2, gt, mw, ctf, wiener, noise_vol = process_batch(batch)
+                power_loss_metric = torch.zeros((), dtype=torch.float32, device=rank)
+                restore_amplitude_ratio_metric = torch.zeros(
+                    (), dtype=torch.float32, device=rank
+                )
 
                 if training_params['CTF_mode'] in  ["phase_only", 'wiener','network']:
                     if training_params["phaseflipped"]:
@@ -365,10 +381,27 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
                                 max_nyquist=training_params['mw_max_nyquist'],
                                 window_alpha=0.0,
                             )
+                            power_loss, restore_amplitude_ratio = (
+                                masked_fourier_shell_power_loss(
+                                    pred_y,
+                                    net_target,
+                                    restore_mask,
+                                    huber_beta=training_params['power_huber_beta'],
+                                    min_shell=training_params['mw_min_shell'],
+                                    max_nyquist=training_params['mw_max_nyquist'],
+                                    window_alpha=0.0,
+                                    return_amplitude_ratio=True,
+                                )
+                            )
                             loss = (
                                 training_params['restore_weight'] * restore_loss
                                 + training_params['visible_weight'] * visible_loss
                                 + training_params['shell_corr_weight'] * shell_corr_loss
+                                + training_params['power_weight'] * power_loss
+                            )
+                            power_loss_metric = power_loss.detach()
+                            restore_amplitude_ratio_metric = (
+                                restore_amplitude_ratio.detach()
                             )
                             # Preserve the historical metric slots in checkpoints,
                             # but label them correctly for single-map training.
@@ -391,6 +424,12 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
                             visible_gradient = torch.autograd.grad(
                                 visible_loss, pred_y, retain_graph=True
                             )[0].norm()
+                            shell_corr_gradient = torch.autograd.grad(
+                                shell_corr_loss, pred_y, retain_graph=True
+                            )[0].norm()
+                            power_gradient = torch.autograd.grad(
+                                power_loss, pred_y, retain_graph=True
+                            )[0].norm()
                             visible_coverage = (
                                 visible_mask.sum(dim=(-3, -2, -1))
                                 / valid_mask.sum(dim=(-3, -2, -1)).clamp_min(1e-8)
@@ -398,8 +437,15 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
                             logging_message = (
                                 f"MW debug: restore_coverage={restore_coverage.item():.4f}, "
                                 f"visible_coverage={visible_coverage.item():.4f}, "
-                                f"restore_grad={restore_gradient.item():.4e}, "
-                                f"visible_grad={visible_gradient.item():.4e}"
+                                f"amplitude_ratio={restore_amplitude_ratio.item():.4f}, "
+                                f"weighted_restore_grad="
+                                f"{(training_params['restore_weight'] * restore_gradient).item():.4e}, "
+                                f"weighted_visible_grad="
+                                f"{(training_params['visible_weight'] * visible_gradient).item():.4e}, "
+                                f"weighted_corr_grad="
+                                f"{(training_params['shell_corr_weight'] * shell_corr_gradient).item():.4e}, "
+                                f"weighted_power_grad="
+                                f"{(training_params['power_weight'] * power_gradient).item():.4e}"
                             )
                             tqdm.write(logging_message)
                                 
@@ -528,6 +574,10 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
                 average_loss += loss.item()
                 average_inside_loss += inside_loss.item()
                 average_outside_loss += outside_loss.item()
+                average_power_loss += power_loss_metric.item()
+                average_restore_amplitude_ratio += (
+                    restore_amplitude_ratio_metric.item()
+                )
                 
                 if i_batch + 1 >= steps_per_epoch_train*training_params['acc_batches']:
                     break
@@ -538,21 +588,37 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
             dist.reduce(average_loss, dst=0)
             dist.reduce(average_inside_loss, dst=0)
             dist.reduce(average_outside_loss, dst=0)
+            dist.reduce(average_power_loss, dst=0)
+            dist.reduce(average_restore_amplitude_ratio, dst=0)
         average_loss /= (world_size * (i_batch + 1))
         average_inside_loss /= (world_size * (i_batch + 1))
         average_outside_loss /= (world_size * (i_batch + 1))
+        average_power_loss /= (world_size * (i_batch + 1))
+        average_restore_amplitude_ratio /= (world_size * (i_batch + 1))
 
         if rank == 0:
             training_params["metrics"]["average_loss"].append(average_loss.cpu().numpy()) 
             training_params["metrics"]["inside_loss"].append(average_inside_loss.cpu().numpy()) 
             training_params["metrics"]["outside_loss"].append(average_outside_loss.cpu().numpy()) 
+            if training_params['method'] == 'isonet2':
+                training_params["metrics"]["power_loss"].append(
+                    average_power_loss.cpu().numpy()
+                )
+                training_params["metrics"]["restore_amplitude_ratio"].append(
+                    average_restore_amplitude_ratio.cpu().numpy()
+                )
 
             outmodel_path = f"{training_params['output_dir']}/network_{training_params['method']}_{training_params['arch']}_{training_params['cube_size']}_{training_params['split']}.pt"
             
             loss_str = f"Epoch [{epoch+1:3d}/{training_params['epochs']:3d}] Loss: {average_loss:6.5f}"
 
             if training_params['method'] == 'isonet2':
-                loss_str += f", visible_loss: {average_inside_loss:6.5f}, restore_loss: {average_outside_loss:6.5f}"
+                loss_str += (
+                    f", visible_loss: {average_inside_loss:6.5f}, "
+                    f"restore_loss: {average_outside_loss:6.5f}, "
+                    f"power_loss: {average_power_loss:6.5f}, "
+                    f"amplitude_ratio: {average_restore_amplitude_ratio:6.5f}"
+                )
             elif training_params['method'] == 'isonet2-n2n':
                 loss_str += f", n2n_loss: {average_inside_loss:6.5f}, mw_loss: {average_outside_loss:6.5f}"
             print(loss_str)
@@ -594,6 +660,13 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
                     'normalization_stats': training_params.get('normalization_stats', {}),
                     'mw_taper_deg': training_params.get('mw_taper_deg', 0.0),
                     'mw_window_alpha': training_params.get('mw_window_alpha', 0.0),
+                    'restore_weight': training_params.get('restore_weight'),
+                    'visible_weight': training_params.get('visible_weight'),
+                    'shell_corr_weight': training_params.get('shell_corr_weight'),
+                    'power_weight': training_params.get('power_weight'),
+                    'power_huber_beta': training_params.get('power_huber_beta'),
+                    'mw_min_shell': training_params.get('mw_min_shell'),
+                    'mw_max_nyquist': training_params.get('mw_max_nyquist'),
                     }, outmodel_path)
                         
             checkpoint_interval = int(training_params.get('checkpoint_interval', training_params['T_max']))

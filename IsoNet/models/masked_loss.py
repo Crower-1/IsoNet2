@@ -157,6 +157,99 @@ def masked_fourier_shell_correlation_loss(
     return (1.0 - mean_correlation).mean()
 
 
+def masked_fourier_shell_power_loss(
+    prediction,
+    target,
+    mask,
+    eps=1e-8,
+    relative_floor=1e-6,
+    huber_beta=0.5,
+    min_shell=3,
+    max_nyquist=0.8,
+    window_alpha=0.15,
+    return_amplitude_ratio=False,
+):
+    """Match mean Fourier power per supervised radial shell.
+
+    Complex MSE can reduce its error by shrinking predictions whose phase is
+    uncertain, while shell correlation is invariant to a positive global
+    rescaling.  This loss closes that gap by applying a Huber penalty to the
+    log power ratio in each valid shell.  ``mask`` may be a soft confidence
+    mask; shells without supervised coefficients are ignored.
+
+    When requested, the second return value is the geometric-mean shell
+    amplitude ratio.  It is a diagnostic metric: 1 means matched power, values
+    below 1 indicate amplitude collapse.
+    """
+    if huber_beta <= 0:
+        raise ValueError("huber_beta must be positive")
+    if relative_floor < 0:
+        raise ValueError("relative_floor must be non-negative")
+
+    prediction_f, target_f, mask = _prepare_fourier_terms(
+        prediction, target, mask, window_alpha
+    )
+    shape = prediction.shape[-3:]
+    shell_index = _shell_indices(shape, prediction.device)
+    max_shell = max(int(min(shape) * 0.5 * float(max_nyquist)), int(min_shell))
+    valid_points = shell_index <= max_shell
+    shell_index = shell_index[valid_points]
+
+    prediction_f = prediction_f.reshape(-1, prediction_f[0, 0].numel())[:, valid_points]
+    target_f = target_f.reshape(-1, target_f[0, 0].numel())[:, valid_points]
+    mask = mask.reshape(-1, mask[0, 0].numel())[:, valid_points]
+    shell_index = shell_index[None].expand(prediction_f.shape[0], -1)
+    shape_out = (prediction_f.shape[0], max_shell + 1)
+
+    prediction_power = torch.zeros(
+        shape_out, device=prediction.device, dtype=torch.float32
+    )
+    target_power = torch.zeros_like(prediction_power)
+    shell_weight = torch.zeros_like(prediction_power)
+    prediction_power.scatter_add_(
+        1, shell_index, prediction_f.abs().square() * mask
+    )
+    target_power.scatter_add_(1, shell_index, target_f.abs().square() * mask)
+    shell_weight.scatter_add_(1, shell_index, mask)
+
+    prediction_power = prediction_power / shell_weight.clamp_min(eps)
+    target_power = target_power / shell_weight.clamp_min(eps)
+    valid_shells = shell_weight > eps
+    valid_shells[:, :min_shell] = False
+    valid_shell_count = valid_shells.sum(dim=1)
+
+    target_scale = (target_power * valid_shells).sum(dim=1, keepdim=True)
+    target_scale = target_scale / valid_shell_count[:, None].clamp_min(1)
+    power_floor = (target_scale.detach() * relative_floor).clamp_min(eps)
+    log_power_ratio = torch.log(
+        (prediction_power + power_floor) / (target_power + power_floor)
+    )
+
+    shell_loss = F.smooth_l1_loss(
+        log_power_ratio,
+        torch.zeros_like(log_power_ratio),
+        reduction="none",
+        beta=huber_beta,
+    )
+    per_sample_loss = (shell_loss * valid_shells).sum(dim=1)
+    per_sample_loss = per_sample_loss / valid_shell_count.clamp_min(1)
+    loss = per_sample_loss.mean()
+
+    if not return_amplitude_ratio:
+        return loss
+
+    mean_log_amplitude_ratio = 0.5 * (
+        log_power_ratio * valid_shells
+    ).sum(dim=1) / valid_shell_count.clamp_min(1)
+    amplitude_ratio = torch.exp(mean_log_amplitude_ratio)
+    amplitude_ratio = torch.where(
+        valid_shell_count > 0,
+        amplitude_ratio,
+        torch.zeros_like(amplitude_ratio),
+    ).mean()
+    return loss, amplitude_ratio
+
+
 class FSCLoss(nn.Module):
     def __init__(self, eps=1e-6, min_shell=1):
         super().__init__()

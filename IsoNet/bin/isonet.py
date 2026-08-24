@@ -657,6 +657,8 @@ class ISONET:
                    restore_weight: float=1.0,
                    visible_weight: float=0.1,
                    shell_corr_weight: float=0.1,
+                   power_weight: float=0.25,
+                   power_huber_beta: float=0.5,
                    mw_min_shell: int=3,
                    mw_max_nyquist: float=0.8,
                    mw_taper_deg: float=3.0,
@@ -716,6 +718,8 @@ class ISONET:
             restore_weight: Weight of the synthetic missing-wedge holdout loss for single-map isonet2.
             visible_weight: Weight of the measured frequencies retained in the synthetic input.
             shell_corr_weight: Weight of phase-sensitive Fourier shell correlation in the restore region.
+            power_weight: Weight of the restore-region radial shell log-power Huber loss.
+            power_huber_beta: Huber transition point used by the shell log-power loss.
             mw_min_shell: Number of central Fourier shells excluded from the single-map objective.
             mw_max_nyquist: Highest Nyquist fraction included in the single-map objective.
             mw_taper_deg: Cosine taper width at missing-wedge boundaries in degrees.
@@ -793,8 +797,18 @@ class ISONET:
             raise ValueError("encoder_trainable must be one of: frozen, deep, all")
         if float(encoder_input_sign) not in [-1.0, 1.0]:
             raise ValueError("encoder_input_sign must be either -1 or +1")
-        if restore_weight <= 0 or visible_weight < 0 or shell_corr_weight < 0:
-            raise ValueError("restore_weight must be positive; visible and shell weights must be non-negative")
+        if (
+            restore_weight <= 0
+            or visible_weight < 0
+            or shell_corr_weight < 0
+            or power_weight < 0
+        ):
+            raise ValueError(
+                "restore_weight must be positive; visible, correlation, and power "
+                "weights must be non-negative"
+            )
+        if power_huber_beta <= 0:
+            raise ValueError("power_huber_beta must be positive")
         if not 0 <= random_rot_weight <= 1:
             raise ValueError("random_rot_weight must be between 0 and 1")
         if not 0 <= min_restore_coverage < 1:
@@ -846,6 +860,8 @@ class ISONET:
             "restore_weight": restore_weight,
             "visible_weight": visible_weight,
             "shell_corr_weight": shell_corr_weight,
+            "power_weight": power_weight,
+            "power_huber_beta": power_huber_beta,
             "mw_min_shell": mw_min_shell,
             "mw_max_nyquist": mw_max_nyquist,
             "mw_taper_deg": mw_taper_deg if method == "isonet2" else 0.0,
