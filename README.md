@@ -355,12 +355,7 @@ For `--input_column`, use:
 
 ### 2.2.4 refine
 
-<<<<<<< HEAD
-
-=======
-
-> > > > > > > merge-isoapp-into-subdir
-> > > > > > > Train the network to predict missing-wedge-corrected, CTF-corrected, and denoised tomograms. `--cube_size` is the length of each subtomogram in voxels. `--mw_weight` determines how heavily missing-wedge correction is prioritized over denoising: here the ratio is 200 to 1. Enabling `--CTF_mode` network multiplies the network input with the CTF, analogous to missing wedge mask application. `--bfactor` boosts high frequency information for CTF correction. (**bfactor** should be lower for celluar tomograms. It can be **zero** or even negative)
+Train the network to predict missing-wedge-corrected, CTF-corrected, and denoised tomograms. `--cube_size` is the length of each subtomogram in voxels. For paired `isonet2-n2n`, `--mw_weight` controls the missing-wedge/denoising balance. Enabling `--CTF_mode network` multiplies the network input with the CTF. `--bfactor` boosts high-frequency information for CTF correction.
 
 ```
 isonet.py refine tomograms.star --method isonet2-n2n --cube_size 128 --epochs 70 --mw_weight 200 --CTF_mode network --bfactor 200 --gpuID <ids>
@@ -402,6 +397,7 @@ Generate a tomograms.star file in the same style as the RELION5 tomographic proc
 - `star_name` — Name of output starfile. Default: `"tomograms.star"`.
 - `tilt_max` — Maximum final tilt angle in degrees. Default: **60**. Use the maximum angle reported in your `.tlt` or `.aln` file after any pre-tilt correction already applied during alignment.
 - `tilt_min` — Minimum final tilt angle in degrees. Default: **-60**. Use the minimum angle reported in your `.tlt` or `.aln` file after any pre-tilt correction already applied during alignment.
+- `tilt_axis_angle` — Reconstruction tilt-axis angle in the XY plane; **0** means Y-aligned. Stored as `rlnTiltAxisAngle`. Default: **0**.
 - `voltage` — Acceleration voltage in kV. Default: **300**.
 
 ### Practical notes
@@ -506,6 +502,7 @@ Use refine for _IsoNet2_ missing-wedge correction (isonet2) or isonet2-n2n combi
 
 - `star_file` — Input STAR listing tomograms and acquisition metadata. Required parameter.
 
+- `add_last` — Residual input addition. Defaults to `False` for single-map `isonet2` and `True` for paired modes.
 - `apply_mw_x1` — Whether to apply missing wedge to subtomograms at the beginning. Default: `True`.
 - `arch` — Network architecture string (e.g., unet-small, unet-medium, unet-large, scunet-fast, resencl-restoration). `resencl-restoration` is a six-stage ResEncL encoder with an nnU-Net-style transposed-convolution restoration decoder and requires every cube dimension to be divisible by 32. Default: `"unet-medium"`.
 - `batch_size` — Number of subtomograms per optimization step; if None, this is automatically determined by multiplying the number of available GPUs by 2. If the number of GPUs is 1, batch size is 4. Batch size per GPU matters for gradient stability. Default: `None`.
@@ -529,11 +526,20 @@ Use refine for _IsoNet2_ missing-wedge correction (isonet2) or isonet2-n2n combi
 - `input_column` — Column name in STAR file to use as input tomograms. Default: `"rlnDeconvTomoName"`.
 - `isCTFflipped` — Whether input tomograms are phase flipped. Default: `False`.
 - `learning_rate` — Initial learning rate. Default: **3e-4**.
-- `learning_rate_min` — Minimum learning rate for scheduler. Default: **3e-4**.
+- `learning_rate_min` — Minimum learning rate for the full-run cosine scheduler. Default: **3e-5**.
 - `loss_func` — Loss function to use (L2, Huber, L1). Default: `"L2"`.
 - `method` — "isonet2" for single-map missing-wedge correction, "isonet2-n2n" for noise2noise when even/odd halves are present. If omitted, the code auto-detects the method from the STAR columns. Default: `"None"` (auto-detect).
 - `mixed_precision` — If True, uses float16/mixed precision to reduce VRAM and speed up training. Default: `True`.
-- `mw_weight` — Weight for missing wedge loss. Higher values correspond to stronger emphasis on missing wedge regions. Disabled by default. Default: **-1** (disabled).
+- `mw_weight` — Legacy missing-wedge weight for paired `isonet2-n2n`. It is ignored by single-map `isonet2`. Default: **-1** (disabled).
+- `restore_weight` — Weight of coefficients hidden by the synthetic missing wedge in single-map training. Start with **1** and search **1–4** if needed. Default: **1**.
+- `visible_weight` — Weight of measured coefficients retained in the synthetic input. Default: **0.1**.
+- `shell_corr_weight` — Weight of phase-sensitive shell correlation in the restore region. Default: **0.1**.
+- `mw_min_shell` — Central Fourier shells excluded from the loss. Default: **3**.
+- `mw_max_nyquist` — Highest Nyquist fraction used by the Fourier loss. Default: **0.8**.
+- `mw_taper_deg` — Cosine taper width at missing-wedge boundaries. Default: **3°**.
+- `mw_window_alpha` — 3-D Tukey window strength for patch FFTs. Default: **0.15**.
+- `min_restore_coverage` — Minimum rotated measured support held out as a restore target. Default: **0.10**.
+- `mw_debug_interval` — Batch interval for updating six debug MRCs and reporting restore/visible coverage and gradient norms; set 0 to disable. Default: **100**.
 - `ncpus` — Number of CPUs to use for data processing. Default: **16**.
 - `noise_level` — Adds artificial noise during training. Default: **0**.
 - `noise_mode` — Controls filter applied when generating synthetic noise (None, ramp, hamming). Default: `"nofilter"`.
@@ -545,10 +551,23 @@ Use refine for _IsoNet2_ missing-wedge correction (isonet2) or isonet2-n2n combi
 - `encoder_learning_rate` — Learning rate for trainable ResEncL encoder parameters; defaults to `learning_rate`.
 - `decoder_learning_rate` — Learning rate for the restoration decoder and output head; defaults to `learning_rate`.
 - `encoder_input_sign` — Sign applied only at the ResEncL encoder input. The validated nnSSL WBP checkpoint uses `-1`, because nnSSL's raw Z-score polarity is opposite to IsoNet2's inverted input convention. Default: **-1**.
-- `random_rot_weight` — Percentage of rotations applied as random augmentation. Default: **0.2**.
+- `random_rot_weight` — Fraction of trilinear random SO(3) rotations; the remainder use exact cube-24 rotations. Default: **0.5**.
 - `save_interval` — Interval to save model checkpoints. Default: **10**.
 - `snrfalloff` — Controls frequency-dependent SNR attenuation applied during deconvolution; larger values reduce high-frequency contribution more aggressively and can stabilize deconvolution on noisy data; smaller values preserve more high-frequency content but risk amplifying noise. Default: **0**.
-- `with_preview` — If True, run prediction every save interval. Default: `True`.
+- `with_preview` — If True, predict saved interval checkpoints after the uninterrupted training run. Default: `True`.
+
+### Single-map WBP / phase-plate example
+
+Single-map `isonet2` requires no even/odd split. Its self-supervision hides a subset of coefficients that were genuinely measured in the WBP, so no network-generated pseudo-target or CTF model is needed:
+
+```bash
+isonet.py refine tomograms.star --method isonet2 \
+  --input_column rlnTomoName --CTF_mode None --add_last False \
+  --restore_weight 1 --visible_weight 0.1 --shell_corr_weight 0.1 \
+  --mw_taper_deg 3 --random_rot_weight 0.5 --gpuID <ids>
+```
+
+If the reconstruction tilt axis is not Y-aligned, add `rlnTiltAxisAngle` to the STAR file. Training and prediction both use it. Inference explicitly copies measured Fourier coefficients from the input WBP and uses the network only in the missing region.
 
 ![](./IsoNet/tutorial_figures/CTF_b_factor.png)
 Fig. 5. Effects of clip_first_peak_mode and bfactor on CTF.
@@ -618,7 +637,7 @@ Use even/odd paired tomograms when you want to use `--method isonet2-n2n`, which
 
 The default is 3000 subtomograms in total per epoch. Changing this default is not usually necessary unless you would like to increase the number of subtomograms for a particularly dense tomogram. Reducing this number is not recommended.
 
-Increasing the number of subtomograms is analogous to increasing the number of training epochs, as subtomograms are extracted during training (as opposed to before, in IsoNet1). Because _IsoNet2_ does not currently use a specialized learning rate scheduler, it is acceptable to keep the default and simply halt training when the loss has converged. We also do not recommend training for fewer than 50 epochs.
+Increasing the number of subtomograms is analogous to increasing the number of training epochs, as subtomograms are extracted during training (as opposed to before, in IsoNet1). Refinement uses one uninterrupted AdamW run and a cosine learning-rate schedule across all epochs. We do not recommend training for fewer than 50 epochs without first confirming convergence on your data.
 
 ## Q: How can I reduce memory usage during training?
 
@@ -654,4 +673,4 @@ You can regenerate the mask using less strict (higher values) `density_percentag
 
 ## Q: What value should I use for mw_weight?
 
-We recommend using higher weights for missing wedge correction (20–200) to prioritize missing wedge reconstruction over general denoising. Keeping `mw_weight` at the default value of 0 disables masked loss, meaning a single loss is used to describe both missing wedge correction and denoising.
+For single-map `--method isonet2`, `mw_weight` is intentionally ignored because restore and visible losses are normalized independently by valid Fourier coefficients and shells. Use `restore_weight` instead; start at **1** and compare **2** or **4** if restore frequencies remain weak. Values such as 200 are not appropriate for the normalized objective. `mw_weight` remains available for the legacy paired `isonet2-n2n` objective.

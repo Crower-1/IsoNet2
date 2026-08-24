@@ -1,5 +1,57 @@
 import numpy as np
 import mrcfile
+from scipy import fft as scipy_fft
+
+
+def robust_mean_std(volume, mask=None, max_samples=2_000_000, trim_percent=1.0, eps=1e-8):
+    """Compute deterministic, outlier-resistant tomogram statistics.
+
+    Values are taken from the specimen mask when available, deterministically
+    subsampled for large tomograms, winsorized, and then summarized by mean and
+    standard deviation.  The same function is used by training and inference.
+    """
+    volume = np.asarray(volume)
+    if mask is not None and np.shape(mask) == volume.shape and np.any(mask > 0):
+        values = volume[np.asarray(mask) > 0]
+    else:
+        z_size = volume.shape[0]
+        half_width = min(30, max(z_size // 2, 1))
+        start = max(z_size // 2 - half_width, 0)
+        stop = min(z_size // 2 + half_width, z_size)
+        values = volume[start:stop].reshape(-1)
+    if values.size > max_samples:
+        stride = int(np.ceil(values.size / max_samples))
+        values = values[::stride]
+    values = np.asarray(values, dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        raise ValueError("Cannot normalize a tomogram with no finite voxels")
+    lower, upper = np.percentile(finite, [trim_percent, 100.0 - trim_percent])
+    clipped = np.clip(finite, lower, upper)
+    mean = float(clipped.mean())
+    std = float(clipped.std())
+    if std < eps:
+        raise ValueError("Cannot normalize a tomogram with near-zero robust standard deviation")
+    return mean, std
+
+
+def fourier_data_consistency(input_volume, network_output, measured_mask):
+    """Keep measured input coefficients and use the network only elsewhere."""
+    input_volume = np.asarray(input_volume, dtype=np.float32)
+    network_output = np.asarray(network_output, dtype=np.float32)
+    measured_mask = np.asarray(measured_mask, dtype=np.float32)
+    if input_volume.shape != network_output.shape or input_volume.shape != measured_mask.shape:
+        raise ValueError(
+            "input_volume, network_output, and measured_mask must have identical shapes"
+        )
+    # scipy.fft preserves float32 -> complex64, which halves peak memory versus
+    # numpy's complex128 FFT on large tomograms.
+    input_f = scipy_fft.fftshift(scipy_fft.fftn(input_volume))
+    prediction_f = scipy_fft.fftshift(scipy_fft.fftn(network_output))
+    input_f *= measured_mask
+    prediction_f *= 1.0 - measured_mask
+    input_f += prediction_f
+    return scipy_fft.ifftn(scipy_fft.ifftshift(input_f)).real.astype(np.float32)
 
 def normalize(x, percentile = True, pmin=5.0, pmax=95.0, axis=None, clip=False, eps=1e-20):
     """Percentile-based image normalization."""
@@ -112,4 +164,3 @@ class DataCubes:
         X_test, Y_test = self.cubesX[-n_val:], self.cubesY[-n_val:]
         X_test, Y_test = np.expand_dims(X_test,-1), np.expand_dims(Y_test,-1)
         return (X_train, Y_train),(X_test, Y_test)
-

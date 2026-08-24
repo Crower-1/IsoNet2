@@ -27,6 +27,9 @@ class Net:
             if encoder_pretrained not in [None, "None", ""]:
                 raise ValueError("Use either pretrained_model or encoder_pretrained, not both.")
             self.load(pretrained_model)
+            if add_last is not None and hasattr(self.model, 'add_last'):
+                self.model.add_last = bool(add_last)
+                self.add_last = bool(add_last)
         else:
             self.initialize(method, arch, cube_size, add_last=add_last,
                             encoder_input_sign=encoder_input_sign)
@@ -146,6 +149,7 @@ class Net:
         #     from IsoNet.models.vtunet import VTUnet
         #     self.model = VTUnet()
         num_params = get_num_parameters(self.model)
+        self.add_last = getattr(self.model, 'add_last', False)
         logging.info(f'Total number of parameters: {num_params}')
 
 
@@ -168,7 +172,12 @@ class Net:
         self.do_phaseflip_input = checkpoint['do_phaseflip_input'] if 'do_phaseflip_input' in checkpoint else True
         self.cube_size = checkpoint['cube_size']
         self.CTF_mode = checkpoint['CTF_mode'] if 'CTF_mode' in checkpoint else None
-        self.initialize(self.method, self.arch, self.cube_size)
+        self.add_last = checkpoint.get('add_last')
+        self.normalization = checkpoint.get('normalization', 'legacy')
+        self.normalization_stats = checkpoint.get('normalization_stats', {})
+        self.mw_taper_deg = float(checkpoint.get('mw_taper_deg', 0.0))
+        self.mw_window_alpha = float(checkpoint.get('mw_window_alpha', 0.0))
+        self.initialize(self.method, self.arch, self.cube_size, add_last=self.add_last)
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.metrics = checkpoint['metrics']
@@ -213,7 +222,9 @@ class Net:
             self.train_dataset = Train_sets_n2n(training_params['star_file'],method=training_params['method'], 
                                         cube_size=training_params['cube_size'], input_column=training_params['input_column'],\
                                         split=training_params['split'], noise_dir=noise_dir, clip_first_peak_mode=clip_first_peak_mode,\
-                                        start_bt_size=training_params["start_bt_size"], bfactor=training_params["bfactor"])
+                                        start_bt_size=training_params["start_bt_size"], bfactor=training_params["bfactor"],
+                                        correct_between_tilts=training_params["correct_between_tilts"],
+                                        mw_taper_deg=training_params.get("mw_taper_deg", 3.0))
 
 
     def train(self, training_params):
@@ -271,9 +282,12 @@ class Net:
         # logging.info('data_shape',data.shape)
         if self.world_size > 1:
             mp.spawn(ddp_predict, args=(self.world_size, self.port_number, self.model, data, tmp_data_path,\
-                                     F_mask,idx), nprocs=self.world_size)
+                                     F_mask, idx, getattr(self, 'mw_window_alpha', 0.0)), nprocs=self.world_size)
         else:
-            ddp_predict(0, self.world_size, self.port_number, self.model, data, tmp_data_path, F_mask, idx)
+            ddp_predict(
+                0, self.world_size, self.port_number, self.model, data, tmp_data_path,
+                F_mask, idx, getattr(self, 'mw_window_alpha', 0.0)
+            )
 
         all_outputs = []
         for r in range(self.world_size):

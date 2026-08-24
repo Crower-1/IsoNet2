@@ -4,6 +4,159 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+_SHELL_INDEX_CACHE = {}
+
+
+def tukey_window_3d(tensor, alpha=0.15):
+    """Return a broadcastable 3-D Tukey window for a BCHWD tensor."""
+    if alpha <= 0:
+        return torch.ones((1, 1, *tensor.shape[-3:]), device=tensor.device, dtype=tensor.dtype)
+
+    def tukey_1d(size):
+        if size <= 1:
+            return torch.ones(size, device=tensor.device, dtype=tensor.dtype)
+        positions = torch.arange(size, device=tensor.device, dtype=tensor.dtype)
+        if alpha >= 1:
+            return 0.5 * (1.0 - torch.cos(2.0 * torch.pi * positions / (size - 1)))
+        edge = alpha * (size - 1) / 2.0
+        window = torch.ones_like(positions)
+        left = positions < edge
+        right = positions > (size - 1 - edge)
+        window[left] = 0.5 * (
+            1.0 + torch.cos(torch.pi * (2.0 * positions[left] / (alpha * (size - 1)) - 1.0))
+        )
+        distance_from_right = size - 1 - positions[right]
+        window[right] = 0.5 * (
+            1.0 + torch.cos(torch.pi * (2.0 * distance_from_right / (alpha * (size - 1)) - 1.0))
+        )
+        return window
+
+    z_window = tukey_1d(tensor.shape[-3])[:, None, None]
+    y_window = tukey_1d(tensor.shape[-2])[None, :, None]
+    x_window = tukey_1d(tensor.shape[-1])[None, None, :]
+    return (z_window * y_window * x_window)[None, None]
+
+
+def _shell_indices(shape, device):
+    key = (tuple(shape), str(device))
+    if key not in _SHELL_INDEX_CACHE:
+        z = torch.arange(shape[0], device=device) - shape[0] // 2
+        y = torch.arange(shape[1], device=device) - shape[1] // 2
+        x = torch.arange(shape[2], device=device) - shape[2] // 2
+        zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")
+        _SHELL_INDEX_CACHE[key] = torch.sqrt(
+            zz.float().square() + yy.float().square() + xx.float().square()
+        ).floor().long().reshape(-1)
+    return _SHELL_INDEX_CACHE[key]
+
+
+def _prepare_fourier_terms(prediction, target, mask, window_alpha):
+    prediction = prediction.to(torch.float32)
+    target = target.to(torch.float32)
+    if window_alpha > 0:
+        window = tukey_window_3d(prediction, alpha=window_alpha)
+        prediction = prediction * window
+        target = target * window
+    prediction_f = fft_3d(prediction)
+    target_f = fft_3d(target)
+    mask = mask.to(device=prediction.device, dtype=torch.float32)
+    if mask.ndim == 3:
+        mask = mask[None, None]
+    elif mask.ndim == 4:
+        mask = mask[:, None]
+    mask = torch.broadcast_to(mask, prediction_f.shape)
+    return prediction_f, target_f, mask
+
+
+def normalized_complex_fourier_loss(
+    prediction,
+    target,
+    mask,
+    eps=1e-8,
+    shell_balanced=False,
+    min_shell=3,
+    max_nyquist=0.8,
+    window_alpha=0.15,
+):
+    """Phase-sensitive Fourier MSE normalized by supervised coefficients.
+
+    With ``shell_balanced=True`` every valid radial shell contributes equally,
+    preventing the much stronger low-frequency power from dominating missing-
+    wedge recovery.
+    """
+    prediction_f, target_f, mask = _prepare_fourier_terms(
+        prediction, target, mask, window_alpha
+    )
+    error = (prediction_f - target_f).abs().square()
+    if not shell_balanced:
+        numerator = (error * mask).sum(dim=(-3, -2, -1))
+        denominator = mask.sum(dim=(-3, -2, -1)).clamp_min(eps)
+        return (numerator / denominator).mean()
+
+    shape = prediction.shape[-3:]
+    shell_index = _shell_indices(shape, prediction.device)
+    max_shell = max(int(min(shape) * 0.5 * float(max_nyquist)), int(min_shell))
+    valid_points = shell_index <= max_shell
+    shell_index = shell_index[valid_points]
+
+    error = error.reshape(-1, error.shape[-3] * error.shape[-2] * error.shape[-1])[:, valid_points]
+    mask = mask.reshape(-1, mask.shape[-3] * mask.shape[-2] * mask.shape[-1])[:, valid_points]
+    shell_index = shell_index[None].expand(error.shape[0], -1)
+    shell_error = torch.zeros(
+        (error.shape[0], max_shell + 1), device=prediction.device, dtype=torch.float32
+    )
+    shell_weight = torch.zeros_like(shell_error)
+    shell_error.scatter_add_(1, shell_index, error * mask)
+    shell_weight.scatter_add_(1, shell_index, mask)
+    shell_mean = shell_error / shell_weight.clamp_min(eps)
+    valid_shells = shell_weight > eps
+    valid_shells[:, :min_shell] = False
+    per_sample = (shell_mean * valid_shells).sum(dim=1) / valid_shells.sum(dim=1).clamp_min(1)
+    return per_sample.mean()
+
+
+def masked_fourier_shell_correlation_loss(
+    prediction,
+    target,
+    mask,
+    eps=1e-6,
+    min_shell=3,
+    max_nyquist=0.8,
+    window_alpha=0.15,
+):
+    """One minus mean phase-sensitive shell correlation in ``mask``."""
+    prediction_f, target_f, mask = _prepare_fourier_terms(
+        prediction, target, mask, window_alpha
+    )
+    shape = prediction.shape[-3:]
+    shell_index = _shell_indices(shape, prediction.device)
+    max_shell = max(int(min(shape) * 0.5 * float(max_nyquist)), int(min_shell))
+    valid_points = shell_index <= max_shell
+    shell_index = shell_index[valid_points]
+
+    prediction_f = prediction_f.reshape(-1, prediction_f[0, 0].numel())[:, valid_points]
+    target_f = target_f.reshape(-1, target_f[0, 0].numel())[:, valid_points]
+    mask = mask.reshape(-1, mask[0, 0].numel())[:, valid_points]
+    shell_index = shell_index[None].expand(prediction_f.shape[0], -1)
+    shape_out = (prediction_f.shape[0], max_shell + 1)
+    cross = torch.zeros(shape_out, device=prediction.device, dtype=torch.float32)
+    prediction_power = torch.zeros_like(cross)
+    target_power = torch.zeros_like(cross)
+    shell_weight = torch.zeros_like(cross)
+    cross.scatter_add_(1, shell_index, (prediction_f * target_f.conj()).real * mask)
+    prediction_power.scatter_add_(1, shell_index, prediction_f.abs().square() * mask)
+    target_power.scatter_add_(1, shell_index, target_f.abs().square() * mask)
+    shell_weight.scatter_add_(1, shell_index, mask)
+    correlation = cross / torch.sqrt(
+        (prediction_power + eps) * (target_power + eps)
+    )
+    correlation = correlation.clamp(-1.0, 1.0)
+    valid_shells = shell_weight > eps
+    valid_shells[:, :min_shell] = False
+    mean_correlation = (correlation * valid_shells).sum(dim=1) / valid_shells.sum(dim=1).clamp_min(1)
+    return (1.0 - mean_correlation).mean()
+
+
 class FSCLoss(nn.Module):
     def __init__(self, eps=1e-6, min_shell=1):
         super().__init__()
@@ -188,5 +341,3 @@ def apply_fourier_mask_to_tomo(tomo, mask, output="real"):
         return vol_filt.real
     elif output == "complex":
         return vol_filt
-
-

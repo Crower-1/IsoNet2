@@ -8,6 +8,7 @@ import mrcfile
 from tqdm import tqdm
 import random
 from IsoNet.utils.missing_wedge import mw3D
+from IsoNet.utils.processing import robust_mean_std
 
 def normalize_percentage(volume, percentile=4, lower_bound = None, upper_bound=None):
     # original_shape = tensor.shape
@@ -92,7 +93,8 @@ class Train_sets_n2n(Dataset):
 
     def __init__(self, tomo_star, method="n2n", cube_size=64, input_column = "rlnTomoName", 
                  split="full", noise_dir=None,correct_between_tilts=False, start_bt_size=48,
-                 snrfalloff=0, deconvstrength=1, highpassnyquist=0.02, clip_first_peak_mode=0, bfactor = 0):
+                 snrfalloff=0, deconvstrength=1, highpassnyquist=0.02, clip_first_peak_mode=0,
+                 bfactor=0, mw_taper_deg=3.0):
         self.star = starfile.read(tomo_star)
         self.method = method
         self.n_tomos = len(self.star)
@@ -126,6 +128,7 @@ class Train_sets_n2n(Dataset):
         self.highpassnyquist=highpassnyquist
         self.has_groundtruth = False
         self.bfactor = bfactor
+        self.mw_taper_deg = mw_taper_deg
 
         self._initialize_data()
         self.length = sum([coords.shape[0] for coords in self.coords])
@@ -158,13 +161,18 @@ class Train_sets_n2n(Dataset):
             self.coords.append(coords)
 
             min_angle, max_angle, tilt_step = row['rlnTiltMin'], row['rlnTiltMax'], 3
+            tilt_axis_angle = row.get('rlnTiltAxisAngle', 0.0)
+            if not self._is_valid_path(tilt_axis_angle):
+                tilt_axis_angle = 0.0
             if not self.correct_between_tilts:
                 tilt_step = None
             if tilt_step not in ["None", None]:
                 start_dim = self.start_bt_size/tilt_step
             else:
                 start_dim = 100000
-            self.mw_list.append(self._compute_missing_wedge(self.cube_size, min_angle, max_angle, tilt_step, start_dim))
+            self.mw_list.append(self._compute_missing_wedge(
+                self.cube_size, min_angle, max_angle, tilt_step, start_dim, tilt_axis_angle
+            ))
             CTF_vol, wiener_vol = self._compute_CTF_vol(row)
             self.wiener_list.append(wiener_vol)
             self.CTF_list.append(CTF_vol)
@@ -187,27 +195,6 @@ class Train_sets_n2n(Dataset):
         if self.has_groundtruth:
             self.tomo_paths_gt.append(row['rlnGroundTruth'])
 
-        # with mrcfile.mmap(row[even_column], mode='r', permissive=True) as tomo_even:
-        #     tomo_shape = tomo_even.data.shape
-        with mrcfile.mmap(row[even_column], mode='r', permissive=True) as tomo_even, \
-             mrcfile.mmap(row[odd_column], mode='r', permissive=True) as tomo_odd:
-            tomo_shape = tomo_even.data.shape
-            Z = tomo_shape[0]
-
-            # _, lower_evn, upper_evn = normalize_percentage(tomo_even.data)
-            # _, lower_odd, upper_odd = normalize_percentage(tomo_odd.data)
-
-            # _, upper_evn, lower_evn = normalize_percentage(tomo_even.data[Z//2-30:Z//2+30])
-            # _, upper_odd, lower_odd = normalize_percentage(tomo_odd.data[Z//2-30:Z//2+30])
-
-            mean = [np.mean(tomo_even.data[Z//2-30:Z//2+30]), np.mean(tomo_odd.data[Z//2-30:Z//2+30])]
-            std = [np.std(tomo_even.data[Z//2-30:Z//2+30]), np.std(tomo_odd.data[Z//2-30:Z//2+30])]
-
-        self.mean.append(mean)
-        self.std.append(std)
-
-        # self.upperbounds.append([upper_evn, upper_odd])
-        # self.lowerbounds.append([lower_evn, lower_odd])
         mask_path = row.get("rlnMaskName") if "rlnMaskName" in column_name_list else None
         if self._is_valid_path(mask_path):
             mask, _ = read_mrc(mask_path)
@@ -215,6 +202,28 @@ class Train_sets_n2n(Dataset):
         else:
             mask_path = None
             mask = None
+
+        # with mrcfile.mmap(row[even_column], mode='r', permissive=True) as tomo_even:
+        #     tomo_shape = tomo_even.data.shape
+        with mrcfile.mmap(row[even_column], mode='r', permissive=True) as tomo_even, \
+             mrcfile.mmap(row[odd_column], mode='r', permissive=True) as tomo_odd:
+            tomo_shape = tomo_even.data.shape
+            if self.method == 'isonet2':
+                even_mean, even_std = robust_mean_std(tomo_even.data, mask=mask)
+                odd_mean, odd_std = robust_mean_std(tomo_odd.data, mask=mask)
+            else:
+                z_size = tomo_shape[0]
+                centre_slice = slice(max(z_size // 2 - 30, 0), min(z_size // 2 + 30, z_size))
+                even_mean = float(np.mean(tomo_even.data[centre_slice]))
+                even_std = float(np.std(tomo_even.data[centre_slice]))
+                odd_mean = float(np.mean(tomo_odd.data[centre_slice]))
+                odd_std = float(np.std(tomo_odd.data[centre_slice]))
+            mean = [even_mean, odd_mean]
+            std = [even_std, odd_std]
+
+        self.mean.append(mean)
+        self.std.append(std)
+
         return mask, mask_path, tomo_shape
 
     def create_random_coords(self, shape, mask, n_samples):
@@ -293,10 +302,19 @@ class Train_sets_n2n(Dataset):
         # rand_inds = [v[sample_inds] for v in valid_inds]
         # return np.stack(rand_inds, -1)
 
-    def _compute_missing_wedge(self, cube_size, min_angle, max_angle, tilt_step, start_dim):
+    def _compute_missing_wedge(
+        self, cube_size, min_angle, max_angle, tilt_step, start_dim, tilt_axis_angle=0.0
+    ):
         """Compute the missing wedge mask for given tilt angles."""
         from IsoNet.utils.missing_wedge import mw3D
-        mw = mw3D(cube_size, missingAngle=[90 + min_angle, 90 - max_angle], tilt_step=tilt_step, start_dim=start_dim)
+        mw = mw3D(
+            cube_size,
+            missingAngle=[90 + min_angle, 90 - max_angle],
+            tilt_step=tilt_step,
+            start_dim=start_dim,
+            tilt_axis_angle=tilt_axis_angle,
+            taper_deg=self.mw_taper_deg,
+        )
         return mw
 
     def _compute_CTF_vol(self, row):

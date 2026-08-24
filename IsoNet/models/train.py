@@ -8,9 +8,22 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from IsoNet.utils.utils import debug_matrix
 import random
-from IsoNet.models.masked_loss import FSCLoss, masked_loss, apply_fourier_mask_to_tomo
+from IsoNet.models.masked_loss import (
+    FSCLoss,
+    masked_loss,
+    apply_fourier_mask_to_tomo,
+    masked_fourier_shell_correlation_loss,
+    normalized_complex_fourier_loss,
+    tukey_window_3d,
+)
 from IsoNet.utils.plot_metrics import plot_metrics
-from IsoNet.utils.rotations import rotation_list, sample_rot_axis_and_angle, rotate_vol_around_axis_torch
+from IsoNet.utils.rotations import (
+    cube_rotations_24,
+    rotation_list,
+    rotate_cube_24,
+    sample_rot_axis_and_angle,
+    rotate_vol_around_axis_torch,
+)
 import torch.optim.lr_scheduler as lr_scheduler
 import shutil
 import math
@@ -77,6 +90,57 @@ def apply_F_filter_torch(input_map,F_map):
     out = torch.fft.ifftn(torch.fft.fftshift(fft_input*F_map, dim=(-1, -2, -3)),dim=(-1, -2, -3))
     out =  torch.real(out)
     return out
+
+
+def prepare_isonet2_batch(
+    x,
+    measured_mask,
+    random_rot_weight=0.5,
+    min_restore_coverage=0.10,
+    window_alpha=0.15,
+    max_attempts=16,
+):
+    """Build a single-map self-supervised frequency holdout task.
+
+    Targets contain only coefficients measured in the original WBP.  No model
+    prediction is ever inserted into the target.
+    """
+    measured_mask = measured_mask.to(dtype=torch.float32).clamp(0.0, 1.0)
+    best = None
+    best_coverage = -1.0
+    for _ in range(max_attempts):
+        if random.random() < random_rot_weight:
+            rotation = sample_rot_axis_and_angle(device=x.device)
+            x_rot = rotate_vol_around_axis_torch(x, rotation, fourier=False)
+            valid_mask = rotate_vol_around_axis_torch(measured_mask, rotation, fourier=True)
+        else:
+            rotation = random.choice(cube_rotations_24)
+            x_rot = rotate_cube_24(x, rotation, fourier=False)
+            valid_mask = rotate_cube_24(measured_mask, rotation, fourier=True)
+        valid_mask = valid_mask.clamp(0.0, 1.0)
+        restore_mask = valid_mask * (1.0 - measured_mask)
+        visible_mask = valid_mask * measured_mask
+        coverage_per_sample = restore_mask.sum(dim=(-3, -2, -1)) / valid_mask.sum(
+            dim=(-3, -2, -1)
+        ).clamp_min(1e-8)
+        coverage = coverage_per_sample.min()
+        coverage_value = float(coverage.detach())
+        candidate = (x_rot, valid_mask, restore_mask, visible_mask, coverage)
+        if coverage_value > best_coverage:
+            best = candidate
+            best_coverage = coverage_value
+        if coverage_value >= min_restore_coverage:
+            break
+
+    x_rot, valid_mask, restore_mask, visible_mask, coverage = best
+    window = tukey_window_3d(x_rot, alpha=window_alpha)
+    net_target = x_rot * window
+    net_input = apply_fourier_mask_to_tomo(
+        tomo=net_target,
+        mask=measured_mask,
+        output="real",
+    )
+    return net_input, net_target, valid_mask, measured_mask, restore_mask, visible_mask, coverage
 def process_batch(batch):
     if len(batch) == 7:
         return [b.cuda() for b in batch]
@@ -251,59 +315,102 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
                     inside_loss = loss
 
                 else:
-                    if random.random()<training_params['random_rot_weight']:
-                        rotate_func = rotate_vol_around_axis_torch
-                        rot = sample_rot_axis_and_angle()
-                    else:
-                        rotate_func = rotate_vol
-                        rot = random.choice(rotation_list)
-
                     if training_params['method'] in ["isonet2"]:
-                        # assert x1 == x2
-                        # x1 = apply_F_filter_torch(x1, mw)
-                        x1,_,_ = normalize_percentage(x1)
-                        # def normalize_percentage(tensor, percentile=4, lower_bound = None, upper_bound=None):
-                        # x1 , lowerbound, upperbound= normalize_percentage(x1)
-
-                        with torch.no_grad():
-                            with torch.autocast("cuda", enabled=training_params["mixed_precision"]): 
-                                preds = model(x1)
-
-                        if training_params['CTF_mode'] in ['network', 'wiener']:
-                            preds = apply_F_filter_torch(preds, ctf)
-
-                        preds = preds.to(torch.float32)
-
-                        x1_filled = apply_F_filter_torch(preds, 1-mw) + apply_F_filter_torch(x1, mw)
-
-                        x1_filled,_,_ = normalize_percentage(x1_filled)
-
-                        x1_filled_rot = rotate_func(x1_filled, rot)
-
-                        x1_filled_rot_mw = apply_F_filter_torch(x1_filled_rot, mw)
-
-                        rotated_mw = rotate_func(mw, rot)
-                        
-                        net_input = x1_filled_rot_mw
-                        net_target = x1_filled_rot
+                        (
+                            net_input,
+                            net_target,
+                            valid_mask,
+                            synthetic_mask,
+                            restore_mask,
+                            visible_mask,
+                            restore_coverage,
+                        ) = prepare_isonet2_batch(
+                            x1,
+                            mw,
+                            random_rot_weight=training_params['random_rot_weight'],
+                            min_restore_coverage=training_params['min_restore_coverage'],
+                            window_alpha=training_params['mw_window_alpha'],
+                        )
 
                         if training_params["noise_level"] > 0:
                             perm = torch.randperm(noise_vol.size(3), device=noise_vol.device)
                             noise_vol = noise_vol[:, :, :, perm, :]
-                            net_input = net_input + training_params["noise_level"] * (noise_vol - noise_vol.mean()) / torch.std(noise_vol, correction=0) #* random.random()
+                            net_input = net_input + training_params["noise_level"] * (noise_vol - noise_vol.mean()) / torch.std(noise_vol, correction=0)
 
                         with torch.autocast('cuda', enabled = training_params["mixed_precision"]): 
                             pred_y = model(net_input).to(torch.float32)
+                            restore_loss = normalized_complex_fourier_loss(
+                                pred_y,
+                                net_target,
+                                restore_mask,
+                                shell_balanced=True,
+                                min_shell=training_params['mw_min_shell'],
+                                max_nyquist=training_params['mw_max_nyquist'],
+                                window_alpha=0.0,
+                            )
+                            visible_loss = normalized_complex_fourier_loss(
+                                pred_y,
+                                net_target,
+                                visible_mask,
+                                shell_balanced=True,
+                                min_shell=training_params['mw_min_shell'],
+                                max_nyquist=training_params['mw_max_nyquist'],
+                                window_alpha=0.0,
+                            )
+                            shell_corr_loss = masked_fourier_shell_correlation_loss(
+                                pred_y,
+                                net_target,
+                                restore_mask,
+                                min_shell=training_params['mw_min_shell'],
+                                max_nyquist=training_params['mw_max_nyquist'],
+                                window_alpha=0.0,
+                            )
+                            loss = (
+                                training_params['restore_weight'] * restore_loss
+                                + training_params['visible_weight'] * visible_loss
+                                + training_params['shell_corr_weight'] * shell_corr_loss
+                            )
+                            # Preserve the historical metric slots in checkpoints,
+                            # but label them correctly for single-map training.
+                            outside_loss = restore_loss
+                            inside_loss = visible_loss
 
-                            if training_params['CTF_mode']  == 'network':
-                                pred_y = apply_F_filter_torch(pred_y, ctf)
-                            elif training_params['CTF_mode']  == 'wiener':
-                                net_target = apply_F_filter_torch(net_target, wiener)
-
-                            outside_loss, inside_loss = masked_loss(pred_y, net_target, rotated_mw, mw, loss_func = loss_func)
-                            loss = loss_func(pred_y, net_target) 
+                        debug_interval = int(training_params.get('mw_debug_interval', 0))
+                        if rank == 0 and debug_interval > 0 and i_batch % debug_interval == 0:
+                            debug_dir = os.path.join(training_params['output_dir'], 'debug_mw')
+                            os.makedirs(debug_dir, exist_ok=True)
+                            debug_matrix(net_target[0], filename=os.path.join(debug_dir, 'x_rot_windowed.mrc'))
+                            debug_matrix(net_input[0], filename=os.path.join(debug_dir, 'net_input.mrc'))
+                            debug_matrix(pred_y[0], filename=os.path.join(debug_dir, 'prediction.mrc'))
+                            debug_matrix(valid_mask[0], filename=os.path.join(debug_dir, 'valid_mask.mrc'))
+                            debug_matrix(synthetic_mask[0], filename=os.path.join(debug_dir, 'synthetic_mask.mrc'))
+                            debug_matrix(restore_mask[0], filename=os.path.join(debug_dir, 'restore_mask.mrc'))
+                            restore_gradient = torch.autograd.grad(
+                                restore_loss, pred_y, retain_graph=True
+                            )[0].norm()
+                            visible_gradient = torch.autograd.grad(
+                                visible_loss, pred_y, retain_graph=True
+                            )[0].norm()
+                            visible_coverage = (
+                                visible_mask.sum(dim=(-3, -2, -1))
+                                / valid_mask.sum(dim=(-3, -2, -1)).clamp_min(1e-8)
+                            ).min()
+                            logging_message = (
+                                f"MW debug: restore_coverage={restore_coverage.item():.4f}, "
+                                f"visible_coverage={visible_coverage.item():.4f}, "
+                                f"restore_grad={restore_gradient.item():.4e}, "
+                                f"visible_grad={visible_gradient.item():.4e}"
+                            )
+                            tqdm.write(logging_message)
                                 
                     elif training_params['method'] in ['isonet2-n2n']:
+
+                        if random.random()<training_params['random_rot_weight']:
+                            rotate_func = rotate_vol_around_axis_torch
+                            rot = sample_rot_axis_and_angle(device=x1.device)
+                        else:
+                            rotate_func = rotate_vol
+                            rot = random.choice(rotation_list)
 
                         # x1_std_orig, x1_mean_orig = x1.std(correction=0,dim=(-3,-2,-1), keepdim=True), x1.mean(dim=(-3,-2,-1), keepdim=True)
                         # x1,_,_ = normalize_mean_std(x1)
@@ -390,7 +497,7 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
                             else:
                                 loss = (loss1 + loss2)/2.
 
-                    if len(gt.shape) > 2:
+                    if len(gt.shape) > 2 and training_params['method'] != 'isonet2':
                         gt_inside_loss = cross_correlate(apply_F_filter_torch(gt, mw), apply_F_filter_torch(preds_x1, mw))
                         gt_outside_loss = cross_correlate(apply_F_filter_torch(gt, 1-mw), apply_F_filter_torch(preds_x1, 1-mw))
                         inside_loss = gt_inside_loss
@@ -424,7 +531,6 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
                 
                 if i_batch + 1 >= steps_per_epoch_train*training_params['acc_batches']:
                     break
-        optimizer.step()            
         scheduler.step()
 
         if world_size > 1:
@@ -445,11 +551,17 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
             
             loss_str = f"Epoch [{epoch+1:3d}/{training_params['epochs']:3d}] Loss: {average_loss:6.5f}"
 
-            if training_params['method'] in ['isonet2', 'isonet2-n2n']:
+            if training_params['method'] == 'isonet2':
+                loss_str += f", visible_loss: {average_inside_loss:6.5f}, restore_loss: {average_outside_loss:6.5f}"
+            elif training_params['method'] == 'isonet2-n2n':
                 loss_str += f", n2n_loss: {average_inside_loss:6.5f}, mw_loss: {average_outside_loss:6.5f}"
             print(loss_str)
 
-            plot_metrics(training_params["metrics"],f"{training_params['output_dir']}/loss_{training_params['split']}.png")
+            plot_metrics(
+                training_params["metrics"],
+                f"{training_params['output_dir']}/loss_{training_params['split']}.png",
+                method=training_params['method'],
+            )
             
             # window = 10
             # pvalue_thresh = 0.05
@@ -476,10 +588,16 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
                     'arch':training_params['arch'],
                     'model_state_dict': model_params,
                     'metrics': training_params["metrics"],
-                    'cube_size': training_params['cube_size']
+                    'cube_size': training_params['cube_size'],
+                    'add_last': training_params.get('add_last'),
+                    'normalization': training_params.get('normalization', 'legacy'),
+                    'normalization_stats': training_params.get('normalization_stats', {}),
+                    'mw_taper_deg': training_params.get('mw_taper_deg', 0.0),
+                    'mw_window_alpha': training_params.get('mw_window_alpha', 0.0),
                     }, outmodel_path)
                         
-            if (epoch+1)%training_params['T_max'] == 0:
+            checkpoint_interval = int(training_params.get('checkpoint_interval', training_params['T_max']))
+            if (epoch + 1) % checkpoint_interval == 0 or epoch + 1 == training_params['epochs']:
                 total_epochs = epoch+1+training_params["starting_epoch"]
                 outmodel_path_epoch = f"{training_params['output_dir']}/network_{training_params['method']}_{training_params['arch']}_{training_params['cube_size']}_epoch{total_epochs}_{training_params['split']}.pt"
                 shutil.copy(outmodel_path, outmodel_path_epoch)
@@ -488,7 +606,10 @@ def ddp_train(rank, world_size, port_number, model, train_dataset, training_para
         dist.destroy_process_group()
 
 
-def ddp_predict(rank, world_size, port_number, model, data, tmp_data_path, F_mask,idx=None):
+def ddp_predict(
+    rank, world_size, port_number, model, data, tmp_data_path, F_mask, idx=None,
+    window_alpha=0.0,
+):
 
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port_number)
@@ -517,7 +638,10 @@ def ddp_predict(rank, world_size, port_number, model, data, tmp_data_path, F_mas
                 batch_input = data[i:i + 1].to(rank)
                 if F_mask is not None:
                     F_m = torch.from_numpy(F_mask[np.newaxis,np.newaxis,:,:,:]).to(rank)
-                    batch_input = apply_F_filter_torch(batch_input, F_m)
+                    window = tukey_window_3d(batch_input, alpha=window_alpha)
+                    batch_input = apply_fourier_mask_to_tomo(
+                        batch_input * window, F_m, output="real"
+                    )
                 batch_output = model(batch_input).cpu()  # Move output to CPU immediately
                 # if rank == 0:
                 #     write_mrc('testIN.mrc', batch_input[0][0].cpu().numpy().astype(np.float32))

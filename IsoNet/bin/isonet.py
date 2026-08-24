@@ -28,7 +28,7 @@ import logging
 import numpy as np
 import starfile
 from IsoNet.models.network import Net
-from IsoNet.utils.processing import normalize
+from IsoNet.utils.processing import fourier_data_consistency, normalize, robust_mean_std
 from IsoNet.utils.missing_wedge import mw3D
 from IsoNet.utils.CTF import get_ctf_3d
 import shutil
@@ -64,7 +64,8 @@ class ISONET:
                      tilt_min: float=-60,
                      tilt_max: float=60,
                      create_average: bool=False,
-                     number_subtomos = 'auto'):
+                     number_subtomos = 'auto',
+                     tilt_axis_angle: float=0.0):
         """
         Generate a tomograms.star file from folder(s) containing tomogram files.
 
@@ -86,7 +87,7 @@ class ISONET:
             ac: Amplitude contrast.
             tilt_min: Minimum final tilt angle used for tomogram reconstruction from your `.tlt` or `.aln` file.
             tilt_max: Maximum final tilt angle used for tomogram reconstruction from your `.tlt` or `.aln` file.
-            tilt_step: Tilt step size.
+            tilt_axis_angle: Reconstruction tilt-axis angle in the XY plane; zero means Y-aligned.
             create_average: Whether to create average tomograms from even/odd pairs.
             number_subtomos: Number of subtomograms to be extracted during training. You can directly modify this in the generated star file or with gui if you want different numbers extracted for different tomograms.
         """
@@ -164,6 +165,7 @@ class ISONET:
         # tilt angle parameters
         add_param("None", "rlnTiltMin",tilt_min)
         add_param("None", "rlnTiltMax",tilt_max)
+        add_param("None", "rlnTiltAxisAngle", tilt_axis_angle)
 
         # subtomogram coordinates
         add_param(coordinate_folder, 'rlnBoxFile', "None")
@@ -374,12 +376,17 @@ class ISONET:
 
         all_tomo_paths = []
         def predict_row(i, row, new_star):
+            tilt_axis_angle = row.get('rlnTiltAxisAngle', 0.0)
+            if tilt_axis_angle is None or not np.isfinite(float(tilt_axis_angle)):
+                tilt_axis_angle = 0.0
+            tilt_axis_angle = float(tilt_axis_angle)
+            taper_deg = float(getattr(network, 'mw_taper_deg', 0.0))
             # 1) Build missing‑wedge mask if requested
             F_mask = (
                 mw3D(cube_size, missingAngle=[
                     90 + float(row.rlnTiltMin),
                     90 - float(row.rlnTiltMax)
-                ]) if apply_mw_x1 else None
+                ], tilt_axis_angle=tilt_axis_angle, taper_deg=taper_deg) if apply_mw_x1 else None
             )
 
             # 2) Optionally incorporate CTF into the mask
@@ -417,27 +424,68 @@ class ISONET:
                 tomo_vol, current_voxel = read_mrc(tomo_p)
                 if voxel_size is None:
                     voxel_size = current_voxel
-                # now we are using precentile again similar to isonet1
                 if network.method =='isonet2':
-                    tomo_vol = normalize(tomo_vol * -1, percentile=True)
+                    if getattr(network, 'normalization', 'legacy') == 'robust_tomogram':
+                        saved_stats = getattr(network, 'normalization_stats', {}).get(
+                            os.path.abspath(tomo_p)
+                        )
+                        if saved_stats is not None:
+                            tomo_mean, tomo_std = saved_stats
+                        else:
+                            specimen_mask = None
+                            mask_path = row.get('rlnMaskName')
+                            if mask_path not in [None, 'None', ''] and mask_path == mask_path:
+                                specimen_mask, _ = read_mrc(mask_path)
+                            tomo_mean, tomo_std = robust_mean_std(tomo_vol, mask=specimen_mask)
+                        tomo_vol = (tomo_mean - tomo_vol) / tomo_std
+                    else:
+                        # Preserve legacy checkpoint behaviour.
+                        tomo_vol = normalize(tomo_vol * -1, percentile=True)
                 else:
                     Z = tomo_vol.shape[0]
                     tomo_vol = tomo_vol*-1
                     mean = np.mean(tomo_vol[Z//2-30:Z//2+30])
                     std = np.std(tomo_vol[Z//2-30:Z//2+30])
                     tomo_vol = (tomo_vol-mean)/std#normalize(tomo_vol * -1, percentile=False)
-                out_data.append(network.predict_map(
+                predicted_volume = network.predict_map(
                     tomo_vol, output_dir,
                     cube_size= int(cube_size / padding_factor+0.1),
                     crop_size=cube_size,
                     F_mask=F_mask,
                     idx=i + 1
-                ))
+                )
+                if network.method == 'isonet2' and apply_mw_x1:
+                    full_measured_mask = mw3D(
+                        tomo_vol.shape,
+                        missingAngle=[
+                            90 + float(row.rlnTiltMin),
+                            90 - float(row.rlnTiltMax),
+                        ],
+                        spherical=False,
+                        tilt_axis_angle=tilt_axis_angle,
+                        taper_deg=taper_deg,
+                    )
+                    predicted_volume = fourier_data_consistency(
+                        tomo_vol, predicted_volume, full_measured_mask
+                    )
+                if (
+                    network.method == 'isonet2'
+                    and getattr(network, 'normalization', 'legacy') == 'robust_tomogram'
+                ):
+                    predicted_volume = tomo_mean - predicted_volume * tomo_std
+                out_data.append(predicted_volume)
 
             out_data = sum(out_data) / len(out_data)
 
             out_file = f"{prefix}.mrc"
-            write_mrc(out_file, out_data.astype(np.float32) * -1, voxel_size=voxel_size)
+            if (
+                network.method == 'isonet2'
+                and getattr(network, 'normalization', 'legacy') == 'robust_tomogram'
+            ):
+                output_volume = out_data.astype(np.float32)
+            else:
+                output_volume = out_data.astype(np.float32) * -1
+            write_mrc(out_file, output_volume, voxel_size=voxel_size)
             all_tomo_paths.append(out_file)
 
 
@@ -466,7 +514,7 @@ class ISONET:
 
                    arch: str='unet-medium',
                    pretrained_model: str=None,
-                   add_last: bool=True,
+                   add_last: bool=None,
 
                    cube_size: int=96,
                    epochs: int=50,
@@ -594,7 +642,7 @@ class ISONET:
                    encoder_learning_rate: float=None,
                    decoder_learning_rate: float=None,
                    encoder_input_sign: float=-1.0,
-                   add_last: bool=True,
+                   add_last: bool=None,
 
                    cube_size: int=96,
                    epochs: int=50,
@@ -604,8 +652,17 @@ class ISONET:
                    loss_func: str = "L2",
                    learning_rate: float=3e-4,
                    save_interval: int=10,
-                   learning_rate_min:float=3e-4,
+                   learning_rate_min:float=3e-5,
                    mw_weight: float=-1,
+                   restore_weight: float=1.0,
+                   visible_weight: float=0.1,
+                   shell_corr_weight: float=0.1,
+                   mw_min_shell: int=3,
+                   mw_max_nyquist: float=0.8,
+                   mw_taper_deg: float=3.0,
+                   mw_window_alpha: float=0.15,
+                   min_restore_coverage: float=0.10,
+                   mw_debug_interval: int=100,
                    apply_mw_x1: bool=True, 
                    mixed_precision: bool=True,
 
@@ -619,7 +676,7 @@ class ISONET:
                    noise_level: float=0, 
                    noise_mode: str="nofilter",
 
-                   random_rot_weight: float=0.2,
+                   random_rot_weight: float=0.5,
 
                    resample_coords_each_epoch: bool=True,
 
@@ -646,7 +703,7 @@ class ISONET:
             encoder_learning_rate: Learning rate for trainable ResEncL encoder parameters. Defaults to learning_rate.
             decoder_learning_rate: Learning rate for the restoration decoder and output head. Defaults to learning_rate.
             encoder_input_sign: Sign applied only before the ResEncL encoder. Use -1 for the supplied nnSSL checkpoint because its raw-data Z-score polarity is opposite to IsoNet2's inverted Z-score convention.
-            add_last: If True, add the input volume to the network output (residual). If None, defaults to True for unet and False for nnunet. 
+            add_last: If True, add the input volume to the network output (residual). Defaults to False for single-map isonet2 and True for paired modes.
             cube_size: Size in voxels of training subvolumes. Must be compatible with the network (divisible by the network downsampling factors). 
             epochs: Number of training epochs. 
             input_column: Column name in STAR file to use as input tomograms. 
@@ -655,7 +712,16 @@ class ISONET:
             learning_rate: Initial learning rate. 
             save_interval: Interval to save model checkpoints. 
             learning_rate_min: Minimum learning rate for scheduler. 
-            mw_weight: Weight for missing wedge loss. Higher values correspond to stronger emphasis on missing wedge regions. Disabled by default. 
+            mw_weight: Legacy paired-mode missing-wedge weight. Ignored by single-map isonet2; use restore_weight instead.
+            restore_weight: Weight of the synthetic missing-wedge holdout loss for single-map isonet2.
+            visible_weight: Weight of the measured frequencies retained in the synthetic input.
+            shell_corr_weight: Weight of phase-sensitive Fourier shell correlation in the restore region.
+            mw_min_shell: Number of central Fourier shells excluded from the single-map objective.
+            mw_max_nyquist: Highest Nyquist fraction included in the single-map objective.
+            mw_taper_deg: Cosine taper width at missing-wedge boundaries in degrees.
+            mw_window_alpha: Tukey window alpha used before patch FFT operations.
+            min_restore_coverage: Minimum fraction of rotated measured support held out for restoration.
+            mw_debug_interval: Batch interval for overwriting MW debug MRCs and reporting coverage/gradient norms. Set 0 to disable.
             apply_mw_x1: Whether to apply missing wedge to subtomograms at the beginning. 
             mixed_precision: If True, uses float16/mixed precision to reduce VRAM and speed up training. 
             CTF_mode: CTF handling mode: "None": No CTF correction, "phase_only": Phase-only correction, "network": Applies CTF-shaped filter to network input, "wiener": Applies Wiener filter to network target
@@ -665,9 +731,9 @@ class ISONET:
             do_phaseflip_input: Whether to apply phase flip during training. 
             noise_level: Adds artificial noise during training. 
             noise_mode: Controls filter applied when generating synthetic noise (None, ramp, hamming). 
-            random_rot_weight: Percentage of rotations applied as random augmentation. 2.
+            random_rot_weight: Fraction of random SO(3) rotations; remaining batches use exact cube-24 rotations.
             resample_coords_each_epoch: If True, resample subtomogram coordinates at the start of each epoch.
-            /: If True, run prediction using the final checkpoint(s) after training. 
+            with_preview: If True, predict saved interval checkpoints after uninterrupted training.
             prev_tomo_idx: If set, automatically predict only the tomograms listed by these indices (e.g., "1,2,4" or "5-10,15,16"). 
             snrfalloff: Controls frequency-dependent SNR attenuation applied during deconvolution; larger values reduce high-frequency contribution more aggressively and can stabilize deconvolution on noisy data; smaller values preserve more high-frequency content but risk amplifying noise. 
             deconvstrength: Scalar multiplier for deconvolution strength; increasing this emphasizes correction and low-frequency recovery but can introduce ringing/artifacts if set too high. 0.
@@ -700,6 +766,8 @@ class ISONET:
                 method = 'isonet2'
         
         if method == "isonet2":
+            if add_last is None:
+                add_last = False
             if noise_level <= 0:
                 logging.info("Your noise_level is 0, we recommend to increase noise_level for denoising during isonet2 training")
             else:
@@ -709,6 +777,13 @@ class ISONET:
                 noise_dir = f"{output_dir}/noise_volumes"
                 # Note: the angle for this noise generation is range(-90,90,3)
                 make_noise_folder(noise_dir,noise_mode,cube_size,num_noise_volume,ncpus=ncpus)
+            if mw_weight > 0:
+                logging.warning(
+                    "--mw_weight is ignored by the measured-frequency isonet2 objective; "
+                    "use --restore_weight (normally 1-4) instead."
+                )
+        elif add_last is None:
+            add_last = True
 
         if encoder_pretrained not in [None, "None", ""] and arch != "resencl-restoration":
             raise ValueError("encoder_pretrained requires --arch resencl-restoration")
@@ -718,6 +793,18 @@ class ISONET:
             raise ValueError("encoder_trainable must be one of: frozen, deep, all")
         if float(encoder_input_sign) not in [-1.0, 1.0]:
             raise ValueError("encoder_input_sign must be either -1 or +1")
+        if restore_weight <= 0 or visible_weight < 0 or shell_corr_weight < 0:
+            raise ValueError("restore_weight must be positive; visible and shell weights must be non-negative")
+        if not 0 <= random_rot_weight <= 1:
+            raise ValueError("random_rot_weight must be between 0 and 1")
+        if not 0 <= min_restore_coverage < 1:
+            raise ValueError("min_restore_coverage must be in [0, 1)")
+        if not 0 < mw_max_nyquist <= 1:
+            raise ValueError("mw_max_nyquist must be in (0, 1]")
+        if mw_min_shell < 0 or mw_taper_deg < 0 or not 0 <= mw_window_alpha <= 1:
+            raise ValueError("MW shell/window/taper parameters are outside their valid range")
+        if mw_debug_interval < 0 or save_interval <= 0 or epochs <= 0:
+            raise ValueError("mw_debug_interval must be non-negative; epochs/save_interval must be positive")
  
         if with_deconv:
             self.deconv(star_file=star_file,
@@ -735,7 +822,7 @@ class ISONET:
                            output_dir=f"{output_dir}/masks",
                            tomo_idx=None)
 
-        if mw_weight > 0:
+        if mw_weight > 0 and method != 'isonet2':
             logging.info("Enabling mw_weight")
             # logging.info("using masked loss seperating in and out of the missing wedge")
 
@@ -756,10 +843,22 @@ class ISONET:
             "decoder_learning_rate":decoder_learning_rate,
             "cube_size": cube_size,
             "mw_weight": mw_weight,
+            "restore_weight": restore_weight,
+            "visible_weight": visible_weight,
+            "shell_corr_weight": shell_corr_weight,
+            "mw_min_shell": mw_min_shell,
+            "mw_max_nyquist": mw_max_nyquist,
+            "mw_taper_deg": mw_taper_deg if method == "isonet2" else 0.0,
+            "mw_window_alpha": mw_window_alpha if method == "isonet2" else 0.0,
+            "min_restore_coverage": min_restore_coverage,
+            "mw_debug_interval": mw_debug_interval,
+            "add_last": add_last,
+            "normalization": "robust_tomogram" if method == "isonet2" else "legacy",
             'apply_mw_x1':apply_mw_x1,
             'mixed_precision':mixed_precision,
             'compile_model':compile_model,
-            'T_max':save_interval,
+            'T_max':epochs,
+            'checkpoint_interval':save_interval,
             'learning_rate_min':learning_rate_min,
             'loss_func':loss_func,
             'CTF_mode':CTF_mode,
@@ -801,28 +900,35 @@ class ISONET:
                     "prefer full encoder fine-tuning."
                 )
         network.prepare_train_dataset(training_params)
+        if method == 'isonet2':
+            training_params['normalization_stats'] = {
+                os.path.abspath(path): (
+                    float(network.train_dataset.mean[index][0]),
+                    float(network.train_dataset.std[index][0]),
+                )
+                for index, path in enumerate(network.train_dataset.tomo_paths_even)
+            }
+        # Train in one optimizer/scheduler lifetime.  Preview checkpoints are
+        # evaluated afterwards so AdamW moments are never reset every interval.
+        network.train(training_params)
         if with_preview:
-            new_epochs = save_interval
-            training_params["epochs"] = new_epochs
-            for step in range(save_interval, epochs+1, save_interval):
-                logging.info(f"Training for {step-save_interval} to {step} epochs")
-                network.train(training_params) #train based on init model and save new one as model_iter{num_iter}.h5
-                model_file = f"{output_dir}/network_{method}_{arch}_{cube_size}_full.pt"
-                shutil.copy(model_file, f"{output_dir}/network_{method}_{arch}_{cube_size}_epoch{step}_full.pt")
-                if mask_update_interval == step // save_interval:
-                    all_tomo_paths = self.predict(star_file=star_file, model=model_file, output_dir=output_dir, gpuID=gpuID, \
-                                isCTFflipped=isCTFflipped, tomo_idx=None,output_prefix=f"corrected_epochs{step}",save_slices=False, input_column=input_column)
-                    logging.info(f"Updating masks based on the corrected tomograms at epoch {step}")
-                    self.make_mask(star_file=star_file,
-                           input_column="rlnCorrectedTomoName",
-                           output_dir=f"{output_dir}/masks_updated_epoch{step}",
-                           tomo_idx=None)
-                else:
-                    all_tomo_paths = self.predict(star_file=star_file, model=model_file, output_dir=output_dir, gpuID=gpuID, \
-                                isCTFflipped=isCTFflipped, tomo_idx=prev_tomo_idx,output_prefix=f"corrected_epochs{step}",save_slices=False, input_column=input_column)
-                save_slices_and_spectrum(all_tomo_paths[0],output_dir,step)
-        else:
-            network.train(training_params) #train based on init model and save new one as model_iter{num_iter}.h5
+            preview_steps = list(range(save_interval, epochs + 1, save_interval))
+            if not preview_steps or preview_steps[-1] != epochs:
+                preview_steps.append(epochs)
+            for step in preview_steps:
+                model_file = f"{output_dir}/network_{method}_{arch}_{cube_size}_epoch{step}_full.pt"
+                all_tomo_paths = self.predict(
+                    star_file=star_file,
+                    model=model_file,
+                    output_dir=output_dir,
+                    gpuID=gpuID,
+                    isCTFflipped=isCTFflipped,
+                    tomo_idx=prev_tomo_idx,
+                    output_prefix=f"corrected_epochs{step}",
+                    save_slices=False,
+                    input_column=input_column,
+                )
+                save_slices_and_spectrum(all_tomo_paths[0], output_dir, step)
 
     def simulate_noise_F(self, size=128, tilt_step=3, repeats=1000, ncpus=51):
         """

@@ -1,5 +1,5 @@
 import os
-def plot_metrics(metrics, filename, bottom=None, top=None):
+def plot_metrics(metrics, filename, bottom=None, top=None, method=None):
     import numpy as np
     import matplotlib.pyplot as plt
     plt.set_loglevel("warning") 
@@ -13,12 +13,20 @@ def plot_metrics(metrics, filename, bottom=None, top=None):
     fig, ax = plt.subplots()
     #with plt.style.context('Solarize_Light2'):
     keys = []
-    display_names = {
-        'inside_loss': 'n2n_loss',
-        'outside_loss': 'mw_loss'
-    }
+    if method == 'isonet2':
+        display_names = {
+            'average_loss': 'total_loss',
+            'inside_loss': 'visible_loss',
+            'outside_loss': 'restore_loss',
+        }
+    else:
+        display_names = {
+            'average_loss': 'total_loss',
+            'inside_loss': 'n2n_loss',
+            'outside_loss': 'mw_loss',
+        }
     for k,v in metrics.items():
-        if len(v)>0 and k != 'average_loss':
+        if len(v)>0:
             x = np.arange(len(v))+1
             plt.plot(x, np.array(v), linewidth=2)
             keys.append(display_names.get(k, k))
