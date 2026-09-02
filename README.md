@@ -457,7 +457,7 @@ Fig. 5. Effects of clip_first_peak_mode and bfactor on CTF.
 
 ## deconv
 
-CTF deconvolution preprocessing that enhances low-resolution contrast and recovers information attenuated by the microscope contrast transfer function. Recommended for non–phase-plate data; skip for phase-plate data or if intending to use network-based CTF deconvolution.
+CTF deconvolution preprocessing that enhances low-resolution contrast and recovers information attenuated by the microscope contrast transfer function. For phase-plate data, `ignore_defocus` enables SynapseSeg-style zero-defocus filtering but does not model the phase-plate phase shift.
 
 ### Key parameters
 
@@ -471,6 +471,7 @@ CTF deconvolution preprocessing that enhances low-resolution contrast and recove
 - `output_dir` — Folder to write deconvolved tomograms (rlnDeconvTomoName entries point here). Default: `"./deconv"`.
 - `overlap_rate` — Fractional overlap between adjacent chunks when chunking; larger overlaps reduce edge artifacts at cost of extra computation. Default: **0.25**.
 - `phaseflipped` — If True, input is assumed already phase-flipped; otherwise the function uses defocus and CTF info to apply phase handling. Default: `False`.
+- `ignore_defocus` — If True, ignores `rlnDefocus` and uses zero defocus in the Wiener filter, matching SynapseSeg's default deconvolution behavior. This does not model the phase-plate phase shift. Default: `False`.
 - `snrfalloff` — Controls frequency-dependent SNR attenuation applied during deconvolution; larger values reduce high-frequency contribution more aggressively and can stabilize deconvolution on noisy data; smaller values preserve more high-frequency content but risk amplifying noise. Default: **1.0**.
 - `tomo_idx` — If set, process only the tomograms listed by these indices (e.g., "1,2,4" or "5-10,15,16"). Default: `None`.
 

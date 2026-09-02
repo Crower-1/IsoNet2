@@ -217,9 +217,10 @@ class ISONET:
         overlap_rate: float= 0.25,
         ncpus:int=4,
         phaseflipped:bool=False,
+        ignore_defocus:bool=False,
         tomo_idx: str=None):
         """
-        CTF deconvolution preprocessing that enhances low-resolution contrast and recovers information attenuated by the microscope contrast transfer function. Recommended for non–phase-plate data; skip for phase-plate data or if intending to use network-based CTF deconvolution.
+        CTF deconvolution preprocessing that enhances low-resolution contrast and recovers information attenuated by the microscope contrast transfer function. For phase-plate data, ignore_defocus enables SynapseSeg-style zero-defocus filtering but does not model the phase-plate phase shift.
 
         Args:
             star_file: Input STAR listing tomograms and acquisition metadata. Required parameter.
@@ -232,6 +233,7 @@ class ISONET:
             overlap_rate: Fractional overlap between adjacent chunks when chunking; larger overlaps reduce edge artifacts at cost of extra computation. 25.
             ncpus: Number of CPU workers for CPU-bound parts of deconvolution; increase on multi-core systems. 
             phaseflipped: If True, input is assumed already phase-flipped; otherwise the function uses defocus and CTF info to apply phase handling. 
+            ignore_defocus: If True, do not read rlnDefocus from the STAR file and use zero defocus for the Wiener filter, matching SynapseSeg's default behavior.
             tomo_idx: If set, process only the tomograms listed by these indices (e.g., "1,2,4" or "5-10,15,16"). 
         """
         def deconv_row(i, row, new_star):
@@ -241,7 +243,7 @@ class ISONET:
             common_kwargs = {
                 "voltage":        row["rlnVoltage"],
                 "cs":             row["rlnSphericalAberration"],
-                "defocus":        row["rlnDefocus"] / 10000.0,
+                "defocus":        0.0 if ignore_defocus else row["rlnDefocus"] / 10000.0,
                 "pixel_size":     row["rlnPixelSize"],
                 "snrfalloff":     snrfalloff,
                 "deconvstrength": deconvstrength,
@@ -261,6 +263,9 @@ class ISONET:
 
             new_star.at[i, "rlnDeconvTomoName"] = deconv_tomo_name 
             logging.info(f"Deconvolved {os.path.relpath(tomo_file)} → {deconv_tomo_name}")
+
+        if ignore_defocus:
+            logging.info("Ignoring STAR defocus values; deconvolution will use 0.0 um defocus")
 
         process_tomograms(
             star_file,

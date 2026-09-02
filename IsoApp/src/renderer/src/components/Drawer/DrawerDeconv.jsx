@@ -8,6 +8,8 @@ import {
     Select,
     MenuItem,
     Button,
+    FormControlLabel,
+    Switch,
 } from '@mui/material'
 import FolderOpenIcon from '@mui/icons-material/FolderOpen'
 import { useDrawerForm } from './useDrawerForm.js'
@@ -28,6 +30,7 @@ const DrawerDeconv = ({ open, onClose, onSubmit }) => {
         deconvstrength: 1,
         highpassnyquist: 0.02,
         ncpus: 4,
+        ignore_defocus: false,
         tomo_idx: 'all'
     })
 
@@ -110,6 +113,15 @@ const DrawerDeconv = ({ open, onClose, onSubmit }) => {
                 />
             </Box>
             <Box display="flex" alignItems="center" gap={2} marginY={2}>
+                <FormControlLabel
+                    control={
+                        <Switch
+                            checked={formData.ignore_defocus}
+                            onChange={(e) => handleChange('ignore_defocus', e.target.checked)}
+                        />
+                    }
+                    label="Ignore defocus (use 0 µm)"
+                />
                 <TextField
                     label="No. of CPUs"
                     type="number"
